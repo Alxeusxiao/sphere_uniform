@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>球面上 N 点均匀分布 · 迭代优化可视化</title>
+<style>
+  :root{
+    --bg:#0b1020; --bg2:#111a33; --panel:#151d38; --line:#25305a;
+    --fg:#e8ecf8; --dim:#8d9ac2; --acc:#5cc8ff; --acc2:#ffd166;
+    --ok:#5ee6a8; --warn:#ff8b6b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:radial-gradient(1200px 800px at 70% 10%,#16204a 0%,var(--bg) 55%);
+    color:var(--fg);font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;overflow:hidden}
+  #app{display:flex;height:100vh}
+  #stage{position:relative;flex:1;min-width:0}
+  canvas{display:block;width:100%;height:100%;cursor:grab}
+  canvas.drag{cursor:grabbing}
+  #hint{position:absolute;left:16px;bottom:14px;color:var(--dim);font-size:12px;
+    background:rgba(10,15,32,.55);padding:6px 10px;border-radius:8px;border:1px solid var(--line)}
+  #badge{position:absolute;left:16px;top:14px;font-size:12px;color:var(--dim);
+    background:rgba(10,15,32,.55);padding:6px 10px;border-radius:8px;border:1px solid var(--line)}
+  aside{width:376px;flex:0 0 376px;height:100%;overflow-y:auto;background:linear-gradient(180deg,#131b34,#0e1429);
+    border-left:1px solid var(--line);padding:16px 16px 40px}
+  h1{font-size:16px;margin:0 0 4px;letter-spacing:.3px}
+  h1 small{display:block;color:var(--dim);font-weight:400;font-size:12px;margin-top:4px;letter-spacing:0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:12px}
+  .card h2{font-size:12px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.8px;text-transform:uppercase}
+  .row{display:flex;align-items:center;gap:8px;margin:8px 0}
+  .row label{flex:0 0 62px;color:var(--dim);font-size:12px}
+  input[type=range]{flex:1;accent-color:var(--acc)}
+  select,button{background:#1b2545;color:var(--fg);border:1px solid var(--line);border-radius:8px;
+    padding:7px 10px;font:inherit;font-size:13px;cursor:pointer}
+  select{flex:1;min-width:0}
+  button:hover{border-color:var(--acc);color:#fff}
+  button.primary{background:linear-gradient(180deg,#2b7fd4,#1f5fa8);border-color:#3a8fe4;font-weight:600}
+  button.primary.on{background:linear-gradient(180deg,#c9563c,#a33c27);border-color:#e0603f}
+  .btns{display:flex;gap:8px;flex-wrap:wrap}
+  .btns button{flex:1 1 auto}
+  .val{font-variant-numeric:tabular-nums;color:var(--acc2);font-weight:600}
+  .metrics{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;font-size:13px}
+  .metrics .k{color:var(--dim)}
+  .metrics .v{font-variant-numeric:tabular-nums;text-align:right;font-weight:600}
+  .metrics .d{font-variant-numeric:tabular-nums;text-align:right;font-size:12px}
+  .good{color:var(--ok)} .mid{color:var(--acc2)} .bad{color:var(--warn)}
+  canvas.mini{width:100%;height:74px;display:block;border-radius:8px;background:#0d1428}
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tabs button{flex:1;padding:6px 4px;font-size:12px}
+  .tabs button.on{background:linear-gradient(180deg,#2b7fd4,#1f5fa8);border-color:#3a8fe4;color:#fff;font-weight:600}
+  .note{color:var(--dim);font-size:12px;margin-top:8px;line-height:1.6}
+  .legend{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);margin-top:8px}
+  .bar{flex:1;height:8px;border-radius:4px;background:linear-gradient(90deg,#3b6fd4,#41c9b0,#ffd166,#ff6b6b)}
+  code{background:#0d1428;padding:1px 5px;border-radius:4px;font-size:12px;color:#9fd0ff}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="globe"></canvas>
+    <div id="badge">拖动旋转 · 滚轮缩放</div>
+    <div id="hint">球面均匀分布：<b>能量最小</b> / <b>最小间距最大</b> / <b>覆盖半径最小</b></div>
+  </div>
+
+  <aside>
+    <h1>球面上 N 点均匀分布<small>三类"最小化"目标 + 迭代优化可视化</small></h1>
+
+    <div class="card">
+      <h2>点数与目标</h2>
+      <div class="row"><label>N = <b id="nOut">32</b></label>
+        <input type="range" id="nRange" min="4" max="2000" step="1" value="32"></div>
+      <div class="row"><label>目标</label>
+        <select id="objSel">
+          <option value="energy">能量最小（Thomson / Riesz，s 可调）</option>
+          <option value="tammes">最小间距最大（Tammes）</option>
+          <option value="cover">覆盖半径最小（covering）</option>
+        </select>
+      </div>
+      <div class="row"><label>来源</label>
+        <select id="srcSel">
+          <option value="pre">预计算最优解</option>
+          <option value="fib">斐波那契格点初值</option>
+        </select>
+      </div>
+      <div class="note" id="dataNote">正在加载数据…</div>
+      <div class="row" style="margin-top:10px"><label>自定义 N</label>
+        <input type="number" id="nCustom" min="2" max="20000" step="1" placeholder="例如 327"
+               style="flex:1;min-width:0;background:#1b2545;color:#e8ecf8;border:1px solid #25305a;
+                      border-radius:8px;padding:7px 10px;font:inherit;font-size:13px">
+        <button id="nApply" title="按该点数生成（有预计算数据则直接用）">生成</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>保存 / 加载</h2>
+      <div class="row"><label>名称</label>
+        <input type="text" id="nameIn" maxlength="40" placeholder="给这份配置起个名字"
+               style="flex:1;min-width:0;background:#1b2545;color:#e8ecf8;border:1px solid #25305a;
+                      border-radius:8px;padding:7px 10px;font:inherit;font-size:13px">
+      </div>
+      <div class="btns">
+        <button id="saveFileBtn" title="把当前点集下载成 JSON 文件">保存到文件</button>
+        <button id="loadFileBtn" title="从 JSON / CSV 文件读入点集">从文件加载</button>
+      </div>
+      <div class="btns" style="margin-top:8px">
+        <button id="favSaveBtn" title="存进浏览器本地收藏夹">存入收藏夹</button>
+        <button id="favClearBtn" title="清空收藏夹">清空收藏夹</button>
+      </div>
+      <input type="file" id="fileIn" accept=".json,.csv,.txt,application/json,text/csv"
+             style="display:none">
+      <div class="note" id="ioNote">收藏夹存在浏览器 localStorage 里；"保存到文件"会下载 JSON。</div>
+      <div id="favList" style="margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <h2>迭代优化（在浏览器里实时跑）</h2>
+      <div class="row"><label>算法</label>
+        <select id="algoSel">
+          <option value="fw">能量最小：Frank–Wolfe</option>
+          <option value="tammes">间距最大：次梯度上升</option>
+          <option value="lloyd">覆盖最小：球面 Lloyd</option>
+        </select>
+      </div>
+      <div class="row"><label>指数 s</label>
+        <select id="sPreset" style="flex:0 0 118px">
+          <option value="1">1（Coulomb）</option>
+          <option value="0">0（对数能量）</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="6">6</option>
+          <option value="12">12</option>
+        </select>
+        <input type="number" id="sInput" step="0.5" min="-20" max="50" value="1"
+               title="Riesz 指数 s：E_s = Σ d^-s；s=0 为对数能量 Σ ln(1/d)"
+               style="flex:1;min-width:0;background:#1b2545;color:#e8ecf8;border:1px solid #25305a;
+                      border-radius:8px;padding:7px 10px;font:inherit;font-size:13px">
+      </div>
+      <div class="btns">
+        <button id="runBtn" class="primary">开始迭代</button>
+        <button id="stepBtn" title="推进一轮（或用右侧步数一次推进多轮）">单步 ▸</button>
+        <button id="resetBtn">重置</button>
+      </div>
+      <div class="row"><label>步数</label>
+        <input type="number" id="stepCount" min="1" max="10000" step="1" value="1"
+               title="点一次单步按钮推进的轮数"
+               style="flex:1;min-width:0;background:#1b2545;color:#e8ecf8;border:1px solid #25305a;
+                      border-radius:8px;padding:7px 10px;font:inherit;font-size:13px">
+        <button id="stepNBtn" title="按上面的步数一次推进">推进 n 步</button>
+      </div>
+      <div class="row"><label>速度</label><input type="range" id="spdRange" min="1" max="60" step="1" value="12"></div>
+      <div class="note" id="iterNote">初始构型为斐波那契格点。点击"开始迭代"观看算法如何把点重新分布。</div>
+    </div>
+
+    <div class="card">
+      <h2>实时指标</h2>
+      <div class="tabs">
+        <button data-m="energy" class="on">能量</button>
+        <button data-m="tammes">最小间距</button>
+        <button data-m="cover">覆盖半径</button>
+      </div>
+      <div class="metrics">
+        <div class="k">能量 E</div><div></div><div class="v" id="mE">–</div>
+        <div class="k">最小夹角 d<sub>min</sub></div><div></div><div class="v" id="mD">–</div>
+        <div class="k">覆盖半径 R<sub>cov</sub></div><div></div><div class="v" id="mR">–</div>
+      </div>
+      <canvas class="mini" id="chart"></canvas>
+      <div class="note" id="cmpNote"></div>
+    </div>
+
+    <div class="card">
+      <h2>显示</h2>
+      <div class="row"><label>球面网格</label>
+        <select id="gridSel">
+          <option value="fib">斐波那契格点</option>
+          <option value="lat">经纬线</option>
+          <option value="none">不显示</option>
+        </select>
+      </div>
+      <div class="row"><label>着色</label>
+        <select id="colorSel">
+          <option value="nbr">最邻点距离</option>
+          <option value="cell">Voronoi 胞腔面积</option>
+          <option value="plain">单色</option>
+        </select>
+      </div>
+      <div class="legend"><span>近</span><div class="bar"></div><span>远</span></div>
+      <div class="btns" style="margin-top:10px">
+        <button id="capBtn">覆盖球冠 (±R<sub>cov</sub>)</button>
+      </div>
+      <div class="note">着色越暖表示该点周围的球面被"占"得越多（更空旷）；均匀分布时着色应接近一致。</div>
+    </div>
+  </aside>
+</div>
+
+<!-- 离线兜底数据：由 make_data.py 生成 sphere_data.js，提供 window.SPHERE_DATA -->
+<script src="sphere_data.js"></script>
+<script>
+"use strict";
+/* ============================================================================
+   0. 数学工具（与 sphoptim.py 保持一致的约定）
+   ========================================================================== */
+const clamp=(x,a,b)=>x<a?a:x>b?b:x;
+function norm3(v){const n=Math.hypot(v[0],v[1],v[2])||1;return [v[0]/n,v[1]/n,v[2]/n];}
+function sub(a,b){return [a[0]-b[0],a[1]-b[1],a[2]-b[2]];}
+function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function cross(a,b){return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
+const GOLDEN=(1+Math.sqrt(5))/2;
+function fibonacciPoints(n){
+  const P=[];
+  for(let i=0;i<n;i++){
+    const z=1-2*(i+0.5)/n, r=Math.sqrt(Math.max(0,1-z*z)), th=2*Math.PI*i/GOLDEN;
+    P.push([r*Math.cos(th),r*Math.sin(th),z]);
+  }
+  return P;
+}
+function gram(P){                       // 返回 Float64Array 的 n*n 点积
+  const n=P.length, G=new Float64Array(n*n);
+  for(let i=0;i<n;i++)for(let j=i;j<n;j++){
+    const d=dot(P[i],P[j]); G[i*n+j]=d; G[j*n+i]=d;
+  }
+  return G;
+}
+/* 最小夹角：注意是 dot 的**最大**值（最小夹角），对角线要排除 */
+function minAngle(P){
+  const n=P.length, G=gram(P); let mx=-2;
+  for(let i=0;i<n;i++)for(let j=i+1;j<n;j++) if(G[i*n+j]>mx) mx=G[i*n+j];
+  return Math.acos(clamp(mx,-1,1));
+}
+/* Riesz s-能量 / 对数能量
+     通用 Riesz : E_s = sum_{i<j} |p_i-p_j|^{-s}       (s > 0；s=2 是"最小化逆平方"等)
+     对数能量   : E_0 = sum_{i<j} ln(1/|p_i-p_j|)      (s -> 0 的极限，与 |p_i-p_j| 的
+                  log 核一致；本文件里 s=0 就用它，梯度与 w_ij = d^{-2} 通用式一致) */
+/* 对数能量（s -> 0 的极限形式）：
+       E_0 = 0.5 * Σ_{i≠j} log(d_ij²) = Σ_{i<j} log(d_ij²)
+   与 sphoptim.py 的取法逐位一致（那里是 log(D2)/2 的有序对求和），
+   交叉验证见 verify_s.js。梯度 g_i = Σ_j d_ij^{-2}(p_i − p_j)。 */
+function logEnergy(P){
+  const n=P.length; let e=0;
+  for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){
+    const dx=P[i][0]-P[j][0],dy=P[i][1]-P[j][1],dz=P[i][2]-P[j][2];
+    const d2=Math.max(dx*dx+dy*dy+dz*dz,1e-300);
+    e += Math.log(d2);               // 与 sphoptim.py 的有序对求和逐位对齐
+  }
+  return e;
+}
+
+function rieszEnergy(P,s=1){
+  const n=P.length; let e=0;
+  if(Math.abs(s)<1e-9) return logEnergy(P);
+  for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){
+    const dx=P[i][0]-P[j][0],dy=P[i][1]-P[j][1],dz=P[i][2]-P[j][2];
+    const d2=dx*dx+dy*dy+dz*dz;
+    e += Math.pow(d2,-s/2);
+  }
+  return e;
+}
+/* Riesz/对数能量的球面切向梯度
+     s > 0 : g_i = s * Σ_j d_ij^{-s-2} (p_i − p_j)
+     s → 0 : g_i =     Σ_j d_ij^{-2}   (p_i − p_j)   （对数能量的梯度）
+   两种情况下都等于 s(⟨p_i,A⟩p_i − A) 的通用式（A = Σ_j w_ij p_j）。 */
+function energyGrad(P,s=1){
+  const n=P.length, G=new Float64Array(n*3);
+  const isLog=Math.abs(s)<1e-9;
+  // 对数能量：w = d^{-2}；真实梯度是 2(⟨p,A⟩p − A)，
+  // 而这里输出 fac*(A − ⟨p,A⟩p)，故对数情形 fac = −1（数值判定见 probe_s0c.py）
+  const fac=isLog?-2:s;
+  const wexp=isLog?2:(s+2);
+  for(let i=0;i<n;i++){
+    let ax=0,ay=0,az=0;
+    for(let j=0;j<n;j++){
+      if(j===i) continue;
+      const dx=P[i][0]-P[j][0],dy=P[i][1]-P[j][1],dz=P[i][2]-P[j][2];
+      const d2=Math.max(dx*dx+dy*dy+dz*dz,1e-30);
+      const w=Math.pow(d2,-wexp/2);
+      ax+=w*P[j][0]; ay+=w*P[j][1]; az+=w*P[j][2];
+    }
+    // g_i = s * (A - <p_i,A> p_i) = s * (I - p p^T) A（A 的切向分量）。
+    // 推导：d/dp_i |p_i-p_j|^{-s} = s d^{-s-2}(p_i-p_j) = s(<p_i,p_j>p_i - p_j)，
+    // 对 j 求和正好是 s*(<p_i,A>p_i - A) 的**相反**投影，故取 A-<p,A>p。
+    // 该公式已用中心差分验证（见 verify_js.js）。
+    const px=P[i][0],py=P[i][1],pz=P[i][2];
+    const c=px*ax+py*ay+pz*az;
+    G[i*3+0]=fac*(ax-c*px);
+    G[i*3+1]=fac*(ay-c*py);
+    G[i*3+2]=fac*(az-c*pz);
+  }
+  return G;
+}
+/* dmin 的次梯度（已用中心差分验证过的公式） */
+function dminSubgrad(P,tol=1.02){
+  const n=P.length, G=gram(P);
+  let mx=-2;
+  for(let i=0;i<n;i++)for(let j=i+1;j<n;j++) if(G[i*n+j]>mx) mx=G[i*n+j];
+  const dmin=Math.acos(clamp(mx,-1,1));
+  const g=new Float64Array(n*3);
+  for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){
+    const dj=Math.acos(clamp(G[i*n+j],-1,1));
+    if(dj>dmin*tol) continue;
+    const c=clamp(G[i*n+j],-1,1), sn=Math.sqrt(Math.max(1-c*c,1e-18));
+    // 对 p_i： -p_j/sn，投影到切平面
+    let gx=-P[j][0]/sn, gy=-P[j][1]/sn, gz=-P[j][2]/sn;
+    let c2=P[i][0]*gx+P[i][1]*gy+P[i][2]*gz;
+    g[i*3+0]+=gx-c2*P[i][0]; g[i*3+1]+=gy-c2*P[i][1]; g[i*3+2]+=gz-c2*P[i][2];
+    gx=-P[i][0]/sn; gy=-P[i][1]/sn; gz=-P[i][2]/sn;
+    c2=P[j][0]*gx+P[j][1]*gy+P[j][2]*gz;
+    g[j*3+0]+=gx-c2*P[j][0]; g[j*3+1]+=gy-c2*P[j][1]; g[j*3+2]+=gz-c2*P[j][2];
+  }
+  return {dmin,g};
+}
+function normalizeAll(P){ return P.map(norm3); }
+
+/* 切平面正交基（用于把球面点映射成二维坐标，只用于排序/凸包等辅助） */
+function basisFor(p){
+  let e1=[1,0,0];
+  if(Math.abs(p[0])>0.9) e1=[0,1,0];
+  const c=dot(e1,p);
+  e1=norm3([e1[0]-c*p[0], e1[1]-c*p[1], e1[2]-c*p[2]]);
+  const e2=cross(p,e1);
+  return [e1,e2];
+}
+/* 二维凸包（Andrew monotone chain），返回逆时针索引 */
+function hull2d(X,Y){
+  const n=X.length; if(n<3) return [];
+  const idx=[...Array(n).keys()].sort((a,b)=> X[a]-X[b] || Y[a]-Y[b]);
+  const crossp=(o,a,b)=>(X[a]-X[o])*(Y[b]-Y[o])-(Y[a]-Y[o])*(X[b]-X[o]);
+  const half=(seq)=>{const st=[];for(const k of seq){
+    while(st.length>=2&&crossp(st[st.length-2],st[st.length-1],k)<=0)st.pop();
+    st.push(k);}return st;};
+  const lo=half(idx), up=half(idx.slice().reverse());
+  const h=lo.slice(0,-1).concat(up.slice(0,-1));
+  if(h.length<3) return [];
+  let a=0; for(let i=0;i<h.length;i++){const j=(i+1)%h.length;a+=X[h[i]]*Y[h[j]]-X[h[j]]*Y[h[i]];}
+  return a<0?h.reverse():h;
+}
+/* ---- 球面 Voronoi 胞腔 ----
+   胞腔 i = { v in S^2 : <v, q_j - p_i> <= 0 for all j }，是若干半球的交。
+   顶点 = 两张约束大圆的交点 = ±normalize((q_a - p_i) x (q_b - p_i))，
+   再按全部约束筛选（A 与 -A 中恰有一个满足所有约束）。
+
+   注意：**不能**用切平面参数化求顶点 —— 球面到切平面的正交投影不保持
+   大圆结构，平面里的"两直线交点"投回球面并不是两条球面大圆的交点。 */
+function neighborSubset(P, i, k) {
+  const n = P.length, order = [];
+  for (let j = 0; j < n; j++) if (j !== i) order.push(j);
+  order.sort((a, b) => dot(P[b], P[i]) - dot(P[a], P[i]));
+  return order.slice(0, Math.min(k, order.length));
+}
+function voronoiCells(P, kNear = 16) {
+  const n = P.length, cells = [];
+  for (let i = 0; i < n; i++) {
+    const nb = neighborSubset(P, i, kNear);
+    if (nb.length < 2) { cells.push([]); continue; }
+    const N = nb.map(j => norm3(sub(P[j], P[i])));
+    const cand = [];
+    for (let a = 0; a < N.length; a++) for (let b = a + 1; b < N.length; b++) {
+      const c = cross(N[a], N[b]);
+      const cn = Math.hypot(c[0], c[1], c[2]);
+      if (cn <= 1e-10) continue;
+      // 两条约束大圆的交点有 ± 两个对跖方向，必须都作为候选
+      // （A 与 -A 中恰有一个落在胞腔内；只取一个会漏掉顶点）
+      cand.push([c[0] / cn, c[1] / cn, c[2] / cn]);
+      cand.push([-c[0] / cn, -c[1] / cn, -c[2] / cn]);
+    }
+    if (!cand.length) { cells.push([]); continue; }
+    const H = [];
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const h = sub(P[j], P[i]), hn = Math.hypot(h[0], h[1], h[2]);
+      if (hn > 1e-12) H.push([h[0] / hn, h[1] / hn, h[2] / hn]);
+    }
+    const V = [];
+    for (const c of cand) {
+      let mx = -2;
+      for (const h of H) { const d = dot(c, h); if (d > mx) mx = d; }
+      if (mx > 1e-9) continue;                       // 只保留满足全部约束的一侧
+      if (!V.some(u => dot(u, c) > 1 - 1e-7)) V.push(c);
+    }
+    if (V.length < 3) { cells.push(V); continue; }
+    const [e1, e2] = basisFor(P[i]);
+    V.sort((a, b) => Math.atan2(dot(a, e2), dot(a, e1)) - Math.atan2(dot(b, e2), dot(b, e1)));
+    cells.push(V);
+  }
+  return cells;
+}
+/* 球面多边形面积（球面盈余 / L'Huilier 的稳定形式） */
+function cellArea(V){
+  const m=V.length; if(m<3) return 0; let a=0;
+  for(let i=0;i<m;i++){
+    const u=V[i], w=V[(i+1)%m];
+    const c=cross(u,w), nc=Math.hypot(c[0],c[1],c[2]);
+    if(nc<1e-15) continue;
+    a += 2*Math.atan2(nc, dot(u,w));
+  }
+  return Math.abs(a);
+}
+function coverageRadius(P){
+  const cells=voronoiCells(P); let R=0;
+  for(let i=0;i<cells.length;i++){
+    const V=cells[i];
+    if(V.length<3){ R=Math.max(R,Math.PI/2); continue; }   // 退化胞腔（半球）
+    for(const v of V) R=Math.max(R,Math.acos(clamp(dot(v,P[i]),-1,1)));
+    for(let k=0;k<V.length;k++){
+      const w=V[(k+1)%V.length], m=norm3([V[k][0]+w[0],V[k][1]+w[1],V[k][2]+w[2]]);
+      R=Math.max(R,Math.acos(clamp(dot(m,P[i]),-1,1)));
+    }
+  }
+  return R;
+}
+
+/* ============================================================================
+   1. 数据
+   ========================================================================== */
+let DATA={};                 // n(string) -> {configs:{energy,tammes,cover}}
+const FALLBACK={};           // 内嵌兜底（无服务器/直接双击打开时用）
+
+/* ============================================================================
+   2. 三维视图
+   ========================================================================== */
+const cv=document.getElementById('globe'), ctx=cv.getContext('2d');
+let W=0,H=0,DPR=1;
+let yaw=-0.6, pitch=0.35, zoom=1;
+let dragging=false, lx=0, ly=0;
+let viewQueued=false;      // 本帧是否已排队重绘（避免同一帧重复 draw）
+
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  const r=cv.parentElement.getBoundingClientRect();
+  W=r.width; H=r.height; cv.width=W*DPR; cv.height=H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize',()=>{resize();frame();});
+
+cv.addEventListener('pointerdown',e=>{dragging=true;lx=e.clientX;ly=e.clientY;cv.classList.add('drag');cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointerup',e=>{dragging=false;cv.classList.remove('drag');frame();});
+cv.addEventListener('pointercancel',e=>{dragging=false;cv.classList.remove('drag');frame();});
+cv.addEventListener('pointermove',e=>{
+  if(!dragging) return;
+  yaw += (e.clientX-lx)*0.008;
+  pitch = clamp(pitch+(e.clientY-ly)*0.008,-1.45,1.45);
+  lx=e.clientX; ly=e.clientY;
+  frame();                                   // 关键：拖动时立即重绘
+});
+cv.addEventListener('wheel',e=>{
+  e.preventDefault();
+  zoom=clamp(zoom*Math.exp(-e.deltaY*0.0012),0.45,4);
+  frame();                                   // 关键：缩放时立即重绘
+},{passive:false});
+
+function project(P){
+  const cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
+  const R=Math.min(W,H)*0.40*zoom, cx=W/2, cyy=H/2;
+  const out=[];
+  for(const p of P){
+    const x=cy*p[0]+sy*p[2], z=-sy*p[0]+cy*p[2], y=p[1];
+    const y2=cp*y-sp*z, z2=sp*y+cp*z;
+    out.push([cx+R*x, cyy-R*y2, z2]);
+  }
+  return out;
+}
+function colorFor(t){                 // t in [0,1] 蓝→青→黄→红
+  const stops=[[59,111,212],[65,201,176],[255,209,102],[255,107,107]];
+  const x=clamp(t,0,1)*(stops.length-1), i=Math.min(Math.floor(x),stops.length-2), f=x-i;
+  const a=stops[i],b=stops[i+1];
+  return [Math.round(a[0]+(b[0]-a[0])*f),Math.round(a[1]+(b[1]-a[1])*f),Math.round(a[2]+(b[2]-a[2])*f)];
+}
+
+/* ============================================================================
+   3. 应用状态
+   ========================================================================== */
+const S={
+  n:32, obj:'energy', src:'pre', algo:'fw',
+  P:[], base:[],              // 当前点集 / 迭代起点
+  running:false, iters:0, speed:12,
+  metric:'energy',
+  hist:{energy:[],tammes:[],cover:[]},
+  colorMode:'nbr', grid:'fib',
+  caps:false, tmp:{e:0,d:0,r:0}, gridPts:[],
+  s:1,                                     // Riesz 指数（0 表示对数能量）
+  objCustom:false,                         // 是否用户手动改过 s
+};
+const FAV_KEY='sphereUniformFavsV1';    // localStorage 键
+const clampN=x=>Math.max(2, Math.min(20000, Math.round(x)||0));
+function escapeHtml(t){return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmtTime(ts){const d=new Date(ts);const p=x=>String(x).padStart(2,'0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;}
+
+/* 导出格式：既方便人读，也能被"从文件加载"和外部脚本复用 */
+function exportConfig(){
+  const m=S.metrics||computeMetrics(S.P);
+  const name=(document.getElementById('nameIn').value||'').trim()
+             ||`N${S.P.length}-${S.obj}`;
+  return {
+    format:'sphere-uniform/v1',
+    name,
+    n:S.P.length,
+    objective:S.obj,
+    riesz:S.s,                               // 能量目标对应的指数（0 = 对数能量）
+    source:S.src,
+    algorithm:S.algo,
+    iterations:S.iters,
+    createdAt:new Date().toISOString(),
+    metrics:{
+      energy:m.e,
+      minAngleDeg:m.d*180/Math.PI,
+      coverageRadiusDeg:m.r*180/Math.PI,
+    },
+    points:S.P.map(p=>[+p[0].toFixed(9),+p[1].toFixed(9),+p[2].toFixed(9)]),
+  };
+}
+function downloadConfig(){
+  const data=exportConfig();
+  const sTag=(data.riesz===undefined?'':`-s${data.riesz}`);
+  const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;
+  a.download=`sphere-${data.name.replace(/[^\w\u4e00-\u9fa5-]+/g,'_')}-N${data.n}${sTag}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  setIoNote(`已下载 ${data.n} 个点的配置（${a.download}）`);
+}
+function setIoNote(t){const e=document.getElementById('ioNote'); if(e) e.textContent=t;}
+
+/* 归一化任意来源的点集；返回 null 表示格式不合法 */
+function sanitizePoints(arr){
+  if(!Array.isArray(arr)||arr.length<2) return null;
+  const out=[];
+  for(const p of arr){
+    let v=null;
+    if(Array.isArray(p)&&p.length>=3) v=[+p[0],+p[1],+p[2]];
+    else if(p&&typeof p==='object'){
+      if(Array.isArray(p.xyz)) v=p.xyz.map(Number);
+      else if('x' in p&&'y' in p&&'z' in p) v=[+p.x,+p.y,+p.z];
+    }
+    if(!v||v.length<3||!v.every(Number.isFinite)) continue;
+    const n=Math.hypot(v[0],v[1],v[2]);
+    if(!(n>1e-12)) continue;
+    out.push([v[0]/n,v[1]/n,v[2]/n]);
+  }
+  return out.length>=2?out:null;
+}
+function parseCSV(text){
+  const rows=text.split(/\r?\n/).map(r=>r.trim()).filter(r=>r&&!r.startsWith('#'));
+  const pts=[];
+  for(const r of rows){
+    const parts=r.split(/[\s,;\t]+/).map(Number);
+    if(parts.length>=3&&parts.slice(0,3).every(Number.isFinite)) pts.push(parts.slice(0,3));
+  }
+  return pts.length>=2?pts:null;
+}
+/* 导入：接受本页面导出的对象、{points:[...]}、纯数组、或 {text:csv} */
+function importConfig(obj){
+  if(!obj) return {ok:false,msg:'内容为空'};
+  let raw=null, name='', meta='';
+  if(typeof obj==='string'){ raw=parseCSV(obj); name='粘贴的点集'; }
+  else if(Array.isArray(obj)){ raw=obj; }
+  else if(obj.text){ raw=parseCSV(obj.text); name=obj.name||'粘贴的点集'; }
+  else {
+    raw=obj.points||obj.pts||obj.vertices||obj.data;
+    name=obj.name||'';
+    if(obj.metrics) meta=`（文件记录：E=${(+obj.metrics.energy).toFixed(4)}，`+
+      `dmin=${(+obj.metrics.minAngleDeg).toFixed(3)}°，R=${(+obj.metrics.coverageRadiusDeg).toFixed(3)}°）`;
+  }
+  const pts=sanitizePoints(raw);
+  if(!pts) return {ok:false,msg:'没找到可用的点集（需要 points: [[x,y,z],…] 或 CSV 三列）'};
+  if(obj&&typeof obj==='object'&&Number.isFinite(Number(obj.riesz))){
+    S.s=clamp(Number(obj.riesz),-20,50);
+    const si=document.getElementById('sInput'), sp=document.getElementById('sPreset');
+    if(si) si.value=String(S.s);
+    if(sp) sp.value=String(S.s);
+  }
+  S.n=pts.length;
+  S.base=pts.map(p=>p.slice());
+  S.P=pts.map(p=>p.slice());
+  S.iters=0; S.running=false; setRunBtn();
+  alphaT=0.05;
+  S.hist={energy:[],tammes:[],cover:[]};
+  syncNControls(pts.length);
+  document.getElementById('nameIn').value=name;
+  S.metrics=computeMetrics(S.P);
+  updateMetrics(); draw();
+  const has=!!DATA[String(S.n)];
+  const do2=document.getElementById('dataNote');
+  if(do2) do2.textContent=`已加载${name?'「'+name+'」':''}：${pts.length} 个点 ${meta}`+
+    (has?'（该 N 有预计算数据，可切换目标对照）':'（自定义/无预计算数据）');
+  return {ok:true,n:pts.length,name};
+}
+function loadConfigText(text,label){
+  let obj;
+  try{ obj=JSON.parse(text); }
+  catch(e){ obj={text, name:label||'CSV'}; }     // 不是 JSON 就按 CSV 处理
+  const r=importConfig(obj);
+  setIoNote(r.ok?`已加载 ${r.n} 个点${r.name?'（'+r.name+'）':''}`:`加载失败：${r.msg}`);
+  return r;
+}
+
+/* ---------------- 收藏夹（localStorage） ---------------- */
+function readFavs(){
+  try{ const a=JSON.parse(localStorage.getItem(FAV_KEY)||'[]'); return Array.isArray(a)?a:[]; }
+  catch(e){ return []; }
+}
+function writeFavs(list){
+  try{ localStorage.setItem(FAV_KEY,JSON.stringify(list)); return true; }
+  catch(e){ setIoNote('收藏夹写入失败：'+(e&&e.message||e)); return false; }
+}
+function saveToGallery(name){
+  const data=exportConfig();
+  if(name) data.name=name;
+  const list=readFavs();
+  const i=list.findIndex(x=>x.name===data.name);
+  const entry={...data, savedAt:Date.now()};
+  if(i>=0) list[i]=entry; else list.push(entry);
+  if(writeFavs(list)){
+    renderFavs();
+    setIoNote(`已存入收藏夹：${data.name}（共 ${list.length} 条）`);
+  }
+}
+function loadFromGallery(idx){
+  const list=readFavs();
+  if(!list[idx]) return;
+  const r=importConfig(list[idx]);
+  setIoNote(r.ok?`已从收藏夹载入：${list[idx].name}`:`载入失败：${r.msg}`);
+}
+function deleteFromGallery(idx){
+  const list=readFavs();
+  if(!list[idx]) return;
+  const nm=list[idx].name;
+  list.splice(idx,1);
+  writeFavs(list); renderFavs();
+  setIoNote(`已删除：${nm}`);
+}
+function clearGallery(){
+  if(!readFavs().length) return;
+  if(!window.confirm('确定清空收藏夹？此操作不可撤销。')) return;
+  writeFavs([]); renderFavs(); setIoNote('收藏夹已清空');
+}
+function renderFavs(){
+  const box=document.getElementById('favList');
+  if(!box) return;
+  const list=readFavs();
+  if(!list.length){ box.innerHTML='<div class="note">收藏夹为空。</div>'; return; }
+  box.innerHTML=list.map((e,i)=>{
+    const m=e.metrics||{};
+    return `<div style="display:flex;gap:6px;align-items:center;margin:4px 0">
+      <button data-fav-load="${i}" style="flex:1;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+        title="加载">${escapeHtml(e.name||('N'+e.n))}
+        <span style="color:#8d9ac2;font-size:11px"> N${e.n} · ${fmtTime(e.savedAt||Date.now())}</span></button>
+      <button data-fav-del="${i}" title="删除" style="flex:0 0 auto;padding:6px 9px">✕</button>
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-fav-load]').forEach(b=>{
+    b.onclick=()=>loadFromGallery(+b.dataset.favLoad);
+  });
+  box.querySelectorAll('[data-fav-del]').forEach(b=>{
+    b.onclick=()=>deleteFromGallery(+b.dataset.favDel);
+  });
+}
+
+/* ---------------- 自定义 N ---------------- */
+function syncNControls(n){
+  const r=document.getElementById('nRange'), o=document.getElementById('nOut'),
+        c=document.getElementById('nCustom');
+  // 统一转成字符串：DOM 的 value/textContent 本身就是字符串语义
+  if(r) r.value=String(Math.min(+(r.max||2000), n));
+  if(o) o.textContent=String(n);
+  if(c) c.value=String(n);
+}
+function applyCustomN(){
+  const el=document.getElementById('nCustom');
+  const raw=String(el.value==null?'':el.value).trim();
+  if(!/^\d+$/.test(raw)){                       // 只接受纯正整数，明确拒绝其它输入
+    setIoNote('请输入 2 ~ 20000 的整数点数（当前输入无效，未做改动）');
+    if(el) el.value=S.n;
+    return;
+  }
+  const v=clampN(parseInt(raw,10));
+  if(!(v>=2)){ setIoNote('请输入 ≥2 的整数点数'); if(el) el.value=S.n; return; }
+  S.n=v;
+  syncNControls(v);
+  gensphere();
+}
+
+/* ============================================================================
+   4. 迭代算法（浏览器内实时实现，与 Python 版同一数学）
+   ========================================================================== */
+/* 沿"归一化弦方向"做稳健一维搜索：多点采样取最优 + 三分细化（能量不保证单峰） */
+function fwStep(P,s=1){
+  const n=P.length, G=energyGrad(P,s), S2=[];
+  for(let i=0;i<n;i++){
+    const gx=G[i*3],gy=G[i*3+1],gz=G[i*3+2], gn=Math.hypot(gx,gy,gz)||1;
+    S2.push([-gx/gn,-gy/gn,-gz/gn]);
+  }
+  const E0=rieszEnergy(P,s);
+  let bt=0,bv=E0;
+  // 每次候选 t 都要算一遍全量能量 O(n^2)：n 大时减少候选数与细化次数
+  const coarse=n>600, fine=n>300;
+  const nCand=coarse?5:(fine?9:15);
+  const nRef=coarse?6:(fine?9:12);
+  const cand=[];
+  for(let k=0;k<=nCand;k++) cand.push(Math.pow(0.5,k));
+  for(const t of cand){
+    const Q=P.map((p,i)=>norm3([(1-t)*p[0]+t*S2[i][0],(1-t)*p[1]+t*S2[i][1],(1-t)*p[2]+t*S2[i][2]]));
+    const v=rieszEnergy(Q,s);
+    if(v<bv){bv=v;bt=t;}
+  }
+  if(bt>0){                       // 在最优 t 附近三分细化
+    let lo=Math.max(0,bt*0.5), hi=Math.min(1,bt*2||1);
+    for(let k=0;k<nRef;k++){
+      const m1=lo+(hi-lo)/3, m2=hi-(hi-lo)/3;
+      const Q1=P.map((p,i)=>norm3([(1-m1)*p[0]+m1*S2[i][0],(1-m1)*p[1]+m1*S2[i][1],(1-m1)*p[2]+m1*S2[i][2]]));
+      const Q2=P.map((p,i)=>norm3([(1-m2)*p[0]+m2*S2[i][0],(1-m2)*p[1]+m2*S2[i][1],(1-m2)*p[2]+m2*S2[i][2]]));
+      if(rieszEnergy(Q1,s)<rieszEnergy(Q2,s)) hi=m2; else lo=m1;
+    }
+    const t=0.5*(lo+hi);
+    const Q=P.map((p,i)=>norm3([(1-t)*p[0]+t*S2[i][0],(1-t)*p[1]+t*S2[i][1],(1-t)*p[2]+t*S2[i][2]]));
+    const v=rieszEnergy(Q,s); if(v<bv){bv=v;bt=t;}
+  }
+  if(bt<=0) return null;
+  return {P:P.map((p,i)=>norm3([(1-bt)*p[0]+bt*S2[i][0],(1-bt)*p[1]+bt*S2[i][1],(1-bt)*p[2]+bt*S2[i][2]])), val:bv};
+}
+function tammesStep(P,alpha){
+  const {dmin,g}=dminSubgrad(P);
+  const n=P.length, out=[];
+  for(let i=0;i<n;i++){
+    const gx=g[i*3],gy=g[i*3+1],gz=g[i*3+2], gn=Math.hypot(gx,gy,gz)||1;
+    const t=Math.min(alpha,0.05);
+    out.push(norm3([P[i][0]+t*gx/gn,P[i][1]+t*gy/gn,P[i][2]+t*gz/gn]));
+  }
+  const dNew=minAngle(out);
+  return {P: out, ok: dNew>=dmin-1e-12, val:dNew};
+}
+let GRID=null;
+function gridPoints(M){
+  if(GRID&&GRID.length===M) return GRID;
+  GRID=fibonacciPoints(M); return GRID;
+}
+function lloydStep(P,M=6000){
+  const Q=gridPoints(M), n=P.length;
+  const acc=Array.from({length:n},()=>[0,0,0]), cnt=new Array(n).fill(0);
+  for(let k=0;k<M;k++){
+    let bi=0,bd=-2;
+    for(let i=0;i<n;i++){ const d=dot(Q[k],P[i]); if(d>bd){bd=d;bi=i;} }
+    acc[bi][0]+=Q[k][0]; acc[bi][1]+=Q[k][1]; acc[bi][2]+=Q[k][2]; cnt[bi]++;
+  }
+  // 迭代中只估一个便宜的覆盖半径（网格上的最坏点），
+  // 精确 R_cov 是 O(n^3)，在 N=900 时单次约 20 秒，绝不能放在每步里。
+  let gridWorst=0;
+  for(let k=0;k<M;k++){
+    let bd=-2;
+    for(let i=0;i<n;i++){ const t=dot(Q[k],P[i]); if(t>bd) bd=t; }
+    const a=Math.acos(clamp(bd,-1,1));
+    if(a>gridWorst) gridWorst=a;
+  }
+  const out=[];
+  for(let i=0;i<n;i++){
+    if(cnt[i]===0||Math.hypot(...acc[i])<1e-12){out.push(P[i]);continue;}
+    // 朝簇质心方向走一小步（阻尼 Lloyd）
+    const c=norm3(acc[i]), t=Math.min(0.5,Math.acos(clamp(dot(c,P[i]),-1,1)));
+    const tan=norm3(sub(c,[P[i][0]*dot(c,P[i]),P[i][1]*dot(c,P[i]),P[i][2]*dot(c,P[i])]));
+    const a=0.7*t;
+    out.push(norm3([P[i][0]*Math.cos(a)+tan[0]*Math.sin(a),
+                    P[i][1]*Math.cos(a)+tan[1]*Math.sin(a),
+                    P[i][2]*Math.cos(a)+tan[2]*Math.sin(a)]));
+  }
+  return {P:out, val:gridWorst};
+}
+
+/* ============================================================================
+   5. 渲染
+   ========================================================================== */
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  const R=Math.min(W,H)*0.40*zoom, cx=W/2, cyy=H/2;
+
+  /* 球体本体 */
+  const g=ctx.createRadialGradient(cx-R*0.35,cyy-R*0.35,R*0.15,cx,cyy,R*1.05);
+  g.addColorStop(0,'#1e2c56'); g.addColorStop(1,'#0c1226');
+  ctx.beginPath(); ctx.arc(cx,cyy,R,0,Math.PI*2); ctx.fillStyle=g; ctx.fill();
+  ctx.strokeStyle='rgba(120,160,255,.35)'; ctx.lineWidth=1; ctx.stroke();
+
+  /* 球面网格 */
+  if(S.grid!=='none'){
+    let pts;
+    // 点数多时降低网格采样密度，避免绘制开销成为瓶颈
+    const dense = S.P.length <= 300;
+    if(S.grid==='fib') pts=fibonacciPoints(dense?4200:(S.P.length<=800?1600:700));
+    else { const step=(dense?10:20);
+      pts=[]; for(let la=-80;la<=80;la+=step) for(let lo=0;lo<360;lo+=step*0.5){
+        const a=la*Math.PI/180,b=lo*Math.PI/180;
+        pts.push([Math.cos(a)*Math.cos(b),Math.sin(a),Math.cos(a)*Math.sin(b)]);} }
+    const pr=project(pts);
+    ctx.fillStyle='rgba(140,175,255,.30)';
+    for(const q of pr){ if(q[2]<0) continue; ctx.fillRect(q[0],q[1],1.4,1.4); }
+  }
+
+  /* 点 */
+  const pr=project(S.P);
+  const order=pr.map((q,i)=>i).sort((a,b)=>pr[a][2]-pr[b][2]);
+  let colors=null;
+  if(S.colorMode!=='plain'&&S.P.length>1) colors=pointColors(S.P,S.colorMode);
+
+  /* 覆盖球冠 */
+  if(S.caps){
+    const Rc=coverageRadius(S.P);
+    ctx.save();
+    for(const p of S.P){
+      const ring=[];
+      const [e1,e2]=basisFor(p);
+      for(let k=0;k<=48;k++){
+        const a=2*Math.PI*k/48;
+        const v=[p[0]*Math.cos(Rc)+Math.sin(Rc)*(Math.cos(a)*e1[0]+Math.sin(a)*e2[0]),
+                 p[1]*Math.cos(Rc)+Math.sin(Rc)*(Math.cos(a)*e1[1]+Math.sin(a)*e2[1]),
+                 p[2]*Math.cos(Rc)+Math.sin(Rc)*(Math.cos(a)*e1[2]+Math.sin(a)*e2[2])];
+        ring.push(v);
+      }
+      const rp=project(ring);
+      ctx.beginPath();
+      let started=false;
+      for(const q of rp){ if(q[2]<-0.05) {started=false;continue;} if(!started){ctx.moveTo(q[0],q[1]);started=true;} else ctx.lineTo(q[0],q[1]); }
+      ctx.strokeStyle='rgba(255,180,90,.55)'; ctx.lineWidth=1; ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  const nPts=S.P.length;
+  const baseR=nPts<=60?3.6:(nPts<=200?3.0:(nPts<=600?2.2:(nPts<=1200?1.7:1.3)));
+  const outline=nPts<=400;                     // 点多时逐点描边太贵，直接关掉
+  for(const i of order){
+    const q=pr[i], z=q[2];
+    if(z<-1.02) continue;
+    const depth=(z+1)/2;                       // 0 背面 → 1 正面
+    const r=baseR*(0.62+0.55*Math.pow(depth,1.6));
+    const alpha=0.28+0.72*depth;
+    let col=[120,170,255];
+    if(colors) col=colors[i];
+    ctx.beginPath(); ctx.arc(q[0],q[1],r,0,Math.PI*2);
+    ctx.fillStyle=`rgba(${col[0]},${col[1]},${col[2]},${alpha})`; ctx.fill();
+    if(outline&&depth>0.86){ ctx.strokeStyle='rgba(255,255,255,.5)'; ctx.lineWidth=0.8; ctx.stroke(); }
+  }
+}
+/* 按需重绘：把同一帧内的多次请求合并成一次 rAF 绘制。
+   用 var 声明便于提升——resize/pointer 监听器在 draw 定义之前就会注册。 */
+var frame = function(){
+  if(viewQueued) return;
+  viewQueued = true;
+  requestAnimationFrame(()=>{ viewQueued=false; draw(); });
+};
+
+function pointColors(P,mode){
+  const n=P.length;
+  if(mode==='cell'){
+    const cells=voronoiCells(P), areas=cells.map(cellArea);
+    const sorted=[...areas].sort((a,b)=>a-b);
+    const lo=sorted[Math.floor(n*0.1)]||0, hi=sorted[Math.floor(n*0.9)]||1;
+    return areas.map(a=>colorFor((a-lo)/((hi-lo)||1)));
+  }
+  /* 最邻点距离：越近越蓝，越远（更空旷）越红。
+     n 很大时 O(n^2) 在全速迭代下会成为瓶颈，此时先用斐波那契格点做近似。 */
+  if(n>900){
+    const M=6000, Q=fibonacciPoints(M);
+    const d=new Array(n).fill(Math.PI);
+    for(let k=0;k<M;k++){
+      let bi=0,bd=-2;
+      for(let i=0;i<n;i++){ const t=dot(Q[k],P[i]); if(t>bd){bd=t;bi=i;} }
+      d[bi]=Math.min(d[bi],Math.acos(clamp(bd,-1,1)));
+    }
+    const fin=d.map(x=>Number.isFinite(x)?x:Math.PI);
+    const lo=Math.min(...fin), hi=Math.max(...fin);
+    return fin.map(x=>colorFor((x-lo)/((hi-lo)||1)));
+  }
+  const d=[];
+  for(let i=0;i<n;i++){
+    let best=Math.PI;
+    for(let j=0;j<n;j++){ if(i===j) continue; best=Math.min(best,Math.acos(clamp(dot(P[i],P[j]),-1,1))); }
+    d.push(best);
+  }
+  const lo=Math.min(...d), hi=Math.max(...d);
+  return d.map(x=>colorFor((x-lo)/((hi-lo)||1)));
+}
+
+/* ============================================================================
+   6. 指标 / 图表
+   ========================================================================== */
+/* 精确 R_cov 需要每个 site 的 Voronoi 胞腔（O(n^2) 起），
+   点很多时改用斐波那契格点估计（略小的下界），并在界面标注"≈"。 */
+const EXACT_COVER_MAX=400;
+function computeMetrics(P){
+  const n=P.length, s=S.s;
+  let r=null, exact=true;
+  if(n<=EXACT_COVER_MAX) r=coverageRadius(P);
+  else {
+    exact=false;
+    const M=n<=900?4000:2000, Q=fibonacciPoints(M);
+    let worst=0;
+    for(let k=0;k<M;k++){
+      let bd=-2;
+      for(let i=0;i<n;i++){ const t=dot(Q[k],P[i]); if(t>bd) bd=t; }
+      const a=Math.acos(clamp(bd,-1,1));
+      if(a>worst) worst=a;
+    }
+    r=worst;
+  }
+  return {e:rieszEnergy(P,s), d:minAngle(P), r, exactCover:exact};
+}
+function fmt(x,n=4){ return Number.isFinite(x)?x.toFixed(n):'–'; }
+/* 预计算参照只对 s=1 的能量目标成立，其它 s 要让用户知道 */
+function updateDataNote(){
+  const el=document.getElementById('dataNote');
+  if(!el) return;
+  const has=!!DATA[String(S.n)];
+  const sIsOne=Math.abs(S.s-1)<1e-12;
+  let base;
+  if(has&&sIsOne) base=`N=${S.n}：已加载预计算解；可切换目标或改用斐波那契初值。`;
+  else if(has) base=`N=${S.n}：有预计算数据，但那是 **s=1** 的解；当前 s=${S.s} 需要自己迭代。`;
+  else base=`N=${S.n}：无预计算数据，使用斐波那契格点。`;
+  if(!sIsOne) base+=`（s=${S.s}${Math.abs(S.s)<1e-12?'，对数能量':''}）`;
+  el.textContent=base;
+}
+
+function updateMetrics(){
+  const m=S.metrics||(S.metrics=computeMetrics(S.P));
+  document.getElementById('mE').textContent=fmt(m.e,5);
+  document.getElementById('mD').textContent=(m.d*180/Math.PI).toFixed(4)+'°';
+  document.getElementById('mR').textContent=
+    (m.exactCover===false?'≈':'')+(m.r*180/Math.PI).toFixed(4)+'°';
+  const v={energy:m.e,tammes:m.d*180/Math.PI,cover:m.r*180/Math.PI}[S.metric];
+  // 历史按时间抽稀（约每 60ms 一个点），否则 60fps 下曲线没有意义
+  const now=performance.now();
+  if(!S.lastPush||now-S.lastPush>60){
+    S.lastPush=now;
+    S.hist[S.metric].push(v);
+    if(S.hist[S.metric].length>600) S.hist[S.metric].shift();
+    drawChart();
+  }
+  const cmp=document.getElementById('cmpNote');
+  const rec=DATA[String(S.n)];
+  if(rec){
+    const c=rec.configs;
+    cmp.innerHTML=`参考（N=${S.n}）：能量 <span class="val">${fmt(c.energy.energy,5)}</span> · `+
+      `d<sub>min</sub> <span class="val">${c.tammes.minDeg.toFixed(4)}°</span> · `+
+      `R<sub>cov</sub> <span class="val">${c.cover.radiusDeg.toFixed(4)}°</span>`;
+  } else cmp.textContent='（该 N 无预计算参考）';
+}
+function drawChart(){
+  const c=document.getElementById('chart');
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  const w=c.clientWidth, h=c.clientHeight;
+  c.width=w*dpr; c.height=h*dpr;
+  const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+  const data=S.hist[S.metric];
+  if(data.length<2) return;
+  const lo=Math.min(...data), hi=Math.max(...data), rg=(hi-lo)||1;
+  g.beginPath();
+  data.forEach((v,i)=>{
+    const x=i/(data.length-1)*w, y=h-4-(v-lo)/rg*(h-10);
+    i?g.lineTo(x,y):g.moveTo(x,y);
+  });
+  g.strokeStyle='#5cc8ff'; g.lineWidth=1.6; g.stroke();
+  g.lineTo(w,h); g.lineTo(0,h); g.closePath();
+  g.fillStyle='rgba(92,200,255,.13)'; g.fill();
+  g.fillStyle='#8d9ac2'; g.font='11px system-ui';
+  g.fillText(hi.toPrecision(6),4,11); g.fillText(lo.toPrecision(6),4,h-3);
+}
+
+/* ============================================================================
+   7. 迭代主循环
+   ========================================================================== */
+let alphaT=0.05, acc=0;
+/* 注意：能量目标的所有评估都必须用当前的 S.s（由 stepAlgo 传入）；
+   否则切换 s 之后，面板显示的能量与算法正在下降的能量不是同一个量。 */
+function stepAlgo(){
+  const n=S.P.length;
+  if(S.algo==='fw'){
+    const res=fwStep(S.P,S.s);
+    if(!res) return false;
+    S.P=res.P; return true;
+  }
+  if(S.algo==='tammes'){
+    const res=tammesStep(S.P,alphaT);
+    if(res.ok){ S.P=res.P; alphaT=Math.min(alphaT*1.02,0.05); return true; }
+    alphaT*=0.6; if(alphaT<1e-7) alphaT=0.02;
+    return true;
+  }
+  if(S.algo==='lloyd'){
+    // 网格规模随 n 自适应，保证每步仍在预算内
+    const M=n<=40?8000:(n<=90?5000:(n<=200?3000:(n<=600?1500:700)));
+    const res=lloydStep(S.P,M);
+    S.P=res.P; return true;
+  }
+  return false;
+}
+/* 走一步迭代并刷新指标/画面；返回 false 表示算法已无法继续 */
+function stepOnce(){
+  if(!stepAlgo()) return false;
+  S.iters++;
+  S.metrics=computeMetrics(S.P);
+  updateMetrics();
+  draw();
+  return true;
+}
+/* 手动推进 n 步（"单步"按钮用 n=1） */
+function stepN(n){
+  let done=0;
+  for(let k=0;k<n;k++){ if(!stepOnce()) break; done++; }
+  const note=document.getElementById('iterNote');
+  if(note) note.textContent=`算法：${algoName(S.algo)} · s=${S.s} · 已迭代 ${S.iters} 轮`+
+    (done<n?`（算法已收敛，本次只推进了 ${done} 步）`:'');
+  return done;
+}
+
+function loop(ts){
+  if(!S.running) return;
+  // 大 N 时每步很贵：按点数缩放时间预算，避免掉帧
+  const n=S.P.length;
+  const scale=n<=200?1:(n<=600?0.6:0.35);
+  const budget=Math.max(3, S.speed*scale);
+  const t0=performance.now();
+  let steps=0;
+  while(performance.now()-t0<budget && steps<Math.max(1,Math.round(S.speed*scale))){
+    if(!stepAlgo()) { S.running=false; setRunBtn(); break; }
+    S.iters++; steps++;
+    if(performance.now()-t0>budget) break;
+  }
+  S.metrics=computeMetrics(S.P);
+  updateMetrics(); draw();
+  document.getElementById('iterNote').textContent=
+    `算法：${algoName(S.algo)} · s=${S.s} · 已迭代 ${S.iters} 轮 · `+
+    `d_min=${(S.metrics.d*180/Math.PI).toFixed(3)}°`;
+  requestAnimationFrame(loop);
+}
+function algoName(a){return {fw:'Frank–Wolfe（能量最小）',tammes:'次梯度上升（间距最大）',lloyd:'球面 Lloyd（覆盖最小）'}[a];}
+
+/* ============================================================================
+   8. 交互绑定
+   ========================================================================== */
+const nRange=document.getElementById('nRange'), nOut=document.getElementById('nOut');
+const objSel=document.getElementById('objSel'), srcSel=document.getElementById('srcSel');
+const algoSel=document.getElementById('algoSel'), spdRange=document.getElementById('spdRange');
+const runBtn=document.getElementById('runBtn'), resetBtn=document.getElementById('resetBtn');
+const gridSel=document.getElementById('gridSel'), colorSel=document.getElementById('colorSel');
+const capBtn=document.getElementById('capBtn');
+
+function setRunBtn(){ runBtn.textContent=S.running?'暂停迭代':'开始迭代'; runBtn.classList.toggle('on',S.running); }
+function gensphere(){
+  const n=S.n;
+  let base;
+  if(S.src==='pre'&&DATA[String(n)]){
+    base=DATA[String(n)].configs[S.obj].pts.map(p=>p.slice());
+  } else {
+    base=fibonacciPoints(n);
+  }
+  S.base=base.map(p=>p.slice());
+  S.P=base.map(p=>p.slice());
+  S.iters=0; alphaT=0.05;
+  S.hist={energy:[],tammes:[],cover:[]};
+  S.metrics=computeMetrics(S.P);
+  updateMetrics(); draw();
+  updateDataNote();
+  document.getElementById('iterNote').textContent=
+    `初始构型 d_min=${(S.metrics.d*180/Math.PI).toFixed(3)}°。点击"开始迭代"。`;
+}
+nRange.oninput=()=>{ S.n=+nRange.value; nOut.textContent=S.n; gensphere(); };
+objSel.onchange=()=>{ S.obj=objSel.value; gensphere(); };
+srcSel.onchange=()=>{ S.src=srcSel.value; gensphere(); };
+algoSel.onchange=()=>{ S.algo=algoSel.value; S.iters=0; alphaT=0.05;
+  document.getElementById('iterNote').textContent='已切换算法：'+algoName(S.algo); };
+spdRange.oninput=()=>{ S.speed=+spdRange.value; };
+runBtn.onclick=()=>{ S.running=!S.running; setRunBtn(); if(S.running) requestAnimationFrame(loop); };
+resetBtn.onclick=()=>{ S.running=false; setRunBtn(); gensphere(); };
+gridSel.onchange=()=>{ S.grid=gridSel.value; draw(); };
+colorSel.onchange=()=>{ S.colorMode=colorSel.value; draw(); };
+capBtn.onclick=()=>{ S.caps=!S.caps; capBtn.classList.toggle('on',S.caps); draw(); };
+
+/* 自定义点数：回车或点"生成" */
+const nCustom=document.getElementById('nCustom');
+if(nCustom){
+  nCustom.addEventListener('keydown',e=>{ if(e.key==='Enter') applyCustomN(); });
+}
+document.getElementById('nApply').onclick=applyCustomN;
+
+/* ---- Riesz 指数 s ---- */
+const sInput=document.getElementById('sInput'), sPreset=document.getElementById('sPreset');
+function applyS(raw, markCustom){
+  const v=Number(raw);
+  if(!Number.isFinite(v)){ setIoNote('s 需要一个数值'); if(sInput) sInput.value=String(S.s); return; }
+  S.s=clamp(v,-20,50);
+  if(sInput) sInput.value=String(S.s);
+  if(sPreset) sPreset.value=String(S.s);
+  S.objCustom=(markCustom!==undefined)?markCustom:true;
+  S.iters=0;
+  S.hist={energy:[],tammes:[],cover:[]};
+  S.metrics=computeMetrics(S.P);
+  updateMetrics(); draw();
+  const note=document.getElementById('iterNote');
+  if(note) note.textContent=`已切换到 s=${S.s}`+
+    (Math.abs(S.s-1)<1e-12?'（Coulomb）':(Math.abs(S.s)<1e-12?'（对数能量）':''))+
+    '。点"单步"或"开始迭代"观察分布变化。';
+  updateDataNote();
+}
+if(sPreset) sPreset.onchange=()=>applyS(sPreset.value, sPreset.value!=='1');
+if(sInput){
+  sInput.addEventListener('change',()=>applyS(sInput.value));
+  sInput.addEventListener('keydown',e=>{ if(e.key==='Enter') applyS(sInput.value); });
+}
+
+/* ---- 单步推进 ---- */
+document.getElementById('stepBtn').onclick=()=>stepN(1);
+document.getElementById('stepNBtn').onclick=()=>{
+  const el=document.getElementById('stepCount');
+  const raw=String(el.value||'1').trim();
+  const n=/^\d+$/.test(raw)?Math.max(1,Math.min(10000,parseInt(raw,10))):1;
+  if(el) el.value=String(n);
+  S.running=false; setRunBtn();               // 手动步进时先停下自动循环
+  stepN(n);
+};
+// 滑块拖动时也同步自定义输入框
+nRange.addEventListener('input',()=>{ syncNControls(S.n); });
+
+/* 保存 / 加载 / 收藏夹 */
+document.getElementById('saveFileBtn').onclick=()=>downloadConfig();
+document.getElementById('favSaveBtn').onclick=()=>{
+  saveToGallery((document.getElementById('nameIn').value||'').trim());
+};
+document.getElementById('favClearBtn').onclick=clearGallery;
+
+const fileIn=document.getElementById('fileIn');
+document.getElementById('loadFileBtn').onclick=()=>fileIn.click();
+fileIn.addEventListener('change',()=>{
+  const f=fileIn.files&&fileIn.files[0];
+  if(!f) return;
+  const rd=new FileReader();
+  rd.onload=()=>loadConfigText(String(rd.result), f.name);
+  rd.onerror=()=>setIoNote('读取文件失败');
+  rd.readAsText(f);
+  fileIn.value='';                       // 允许连续载入同一个文件
+});
+
+/* 拖放文件到画布或侧栏也能加载 */
+const dropTargets=[cv, document.querySelector('aside')].filter(Boolean);
+dropTargets.forEach(el=>{
+  el.addEventListener('dragover',e=>{ e.preventDefault(); });
+  el.addEventListener('drop',e=>{
+    e.preventDefault();
+    const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];
+    if(!f) return;
+    const rd=new FileReader();
+    rd.onload=()=>loadConfigText(String(rd.result), f.name);
+    rd.readAsText(f);
+  });
+});
+document.querySelectorAll('.tabs button').forEach(b=>{
+  b.onclick=()=>{ document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); S.metric=b.dataset.m; S.hist[S.metric]=[]; drawChart(); };
+});
+
+/* ============================================================================
+   9. 启动：优先加载 sphere_data.json，失败则用内嵌兜底
+   ========================================================================== */
+async function boot(){
+  let ok=false;
+  try{
+    const r=await fetch('sphere_data.json',{cache:'no-store'});
+    if(r.ok){ DATA=await r.json(); ok=true; }
+  }catch(e){ /* 直接双击打开时 fetch 会失败，走兜底 */ }
+  if(!ok){
+    /* 离线（file://）时 fetch 会被浏览器拦截，改用生成好的 sphere_data.js */
+    try{
+      if(window.SPHERE_DATA){ DATA=window.SPHERE_DATA; ok=true; }
+    }catch(e){}
+  }
+  if(!ok){
+    const emb=document.getElementById('embedded-data');
+    if(emb){ try{ DATA=JSON.parse(emb.textContent); ok=true; }catch(e){} }
+  }
+  if(!ok){
+    DATA={};
+    for(const n of [6,12,20,32,60]){
+      const fib=fibonacciPoints(n);
+      DATA[String(n)]={configs:{energy:{pts:fib,energy:rieszEnergy(fib),minDeg:minAngle(fib)*180/Math.PI},
+                                tammes:{pts:fib,minDeg:minAngle(fib)*180/Math.PI,energy:rieszEnergy(fib)},
+                                cover:{pts:fib,radiusDeg:coverageRadius(fib)*180/Math.PI,minDeg:minAngle(fib)*180/Math.PI,energy:rieszEnergy(fib)}}};
+    }
+    document.getElementById('dataNote').textContent='未找到 sphere_data.json，已用斐波那契格点兜底。';
+  } else {
+    document.getElementById('dataNote').textContent=
+      `已加载 ${Object.keys(DATA).length} 组预计算解（N = ${Object.keys(DATA).map(Number).sort((a,b)=>a-b).join(', ')}）。`;
+  }
+  gensphere();
+  renderFavs();
+  syncNControls(S.n);
+  if(sInput) sInput.value=String(S.s);
+  if(sPreset) sPreset.value=String(S.s);
+  updateDataNote();
+}
+resize();
+boot();
+</script>
+</body>
+</html>
