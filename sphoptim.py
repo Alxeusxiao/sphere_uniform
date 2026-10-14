@@ -166,6 +166,11 @@ def pairwise_stats(P: np.ndarray) -> Dict[str, float]:
 # --------------------------------------------------------------------------
 # 算法 1：增量 Frank-Wolfe（Thomson / Riesz 能量极小化）
 # --------------------------------------------------------------------------
+def _arc_point(p: np.ndarray, ut: np.ndarray, t: float) -> np.ndarray:
+    """大圆上从 p 出发、沿单位切向量 ut 走弧长 t 的点（严格在单位球面上）。"""
+    return p * math.cos(t) + ut * math.sin(t)
+
+
 def _arc_dir(p: np.ndarray, q: np.ndarray) -> Optional[np.ndarray]:
     """球面大圆在 p 处、朝 q 的单位切向量（几何量，供可视化/演示使用）。
 
@@ -696,7 +701,6 @@ def solve_all(n: int, s: float = 1.0, iters_energy: int = 400,
     #   收集一批候选（能量多起点 / Tammes / Lloyd / k-center 局部搜索），
     #   全部用**精确 R_cov** 评估后取最小者。
     t0 = time.time()
-    from cover_solver import solve_cover           # 延迟导入，避免循环依赖
     res = solve_cover(n, seed=seed, energy_iters=iters_energy,
                       tammes_iters=iters_tammes)
     Pc_best = normalize(res["points"])
@@ -709,8 +713,30 @@ def solve_all(n: int, s: float = 1.0, iters_energy: int = 400,
         "history": [],
         "source": res.get("tag", ""),
     }
+    # ---- 4. Voronoi 面积均匀度 ----
+    t0 = time.time()
+    res_a = solve_area(n, seed=seed, iters=100)
+    Pa_best = normalize(res_a["points"])
+    cv_best = area_uniformity(Pa_best)[0]
+    src_a = res_a.get("tag", "")
+    # 三个既有目标的解也一起比：谁 cv 更小就用谁
+    for key in ("energy", "tammes", "cover"):
+        Pk = out[key]["points"]
+        ck = area_uniformity(Pk)[0]
+        if ck < cv_best - 1e-12:
+            Pa_best, cv_best, src_a = Pk, ck, key
+    out["area"] = {
+        "points": Pa_best,
+        "cv": cv_best,
+        "min_deg": math.degrees(min_angle(Pa_best)),
+        "energy": riesz_energy(Pa_best, s),
+        "history": res_a.get("history", []),
+        "source": src_a,
+    }
+    _log("area", t0, out["area"]["cv"])
+
     # 保险：若能量解或 Tammes 解的 R_cov 更小，就换过来（保证 cover 确实最优）
-    for key in ("energy", "tammes"):
+    for key in ("energy", "tammes", "area"):
         Pk = out[key]["points"]
         Rk = coverage_radius(Pk)
         if Rk < r_best - 1e-12:
@@ -722,6 +748,372 @@ def solve_all(n: int, s: float = 1.0, iters_energy: int = 400,
             out["cover"]["source"] = key
     _log("cover", t0, out["cover"]["radius_deg"])
     return out
+
+
+# --------------------------------------------------------------------------
+# 算法 6：Voronoi 面积均匀度（最小化胞腔面积的离散度）
+# --------------------------------------------------------------------------
+# 定义：A_i 为第 i 个 Voronoi 胞腔的球面面积，ΣA_i = 4π。
+#       cv(P) = std(A_i) / mean(A_i)，越小说明"每个点分到的球面越接近相等"。
+# 这是最贴近"均匀"直觉的度量：既不看最近邻，也不只看最坏方向，而是看整体分配。
+#
+# 与 Lloyd 的关系：Lloyd（朝胞腔质心移动）最小化的是均方距离，但它在实践中
+# 也能大幅降低 cv；再加"面积权重" w_i ∝ Ā/A_i 可以进一步降低。
+# 实验数据（proto_area.py，n=50 / 150 步）：裸 Lloyd 降 78.6%，
+# 加权 Lloyd 降 81.7%~82.3%；"带符号远离"几乎无效（1.6%）。
+
+def cell_area(V: np.ndarray) -> float:
+    """球面凸多边形面积 = 球面盈余 = (内角之和) − (m−2)π。
+
+    注意：不能用"Σ 2·atan2(|u×w|, u·w)"那类平面惯性写法——它对球面多边形
+    不成立（实测正二十面体一个胞腔会算成 7.30 而非 2π）。这里逐个顶点求
+    内角（用顶点处两条切向量的夹角），再减去 (m−2)π。
+    顶点表由 voronoi_cells 保证是绕 site 逆时针排列，因此结果为正值。
+    """
+    m = len(V)
+    if m < 3:
+        return 0.0
+    total = 0.0
+    for i in range(m):
+        p0 = V[i]
+        a, b = V[(i - 1) % m], V[(i + 1) % m]
+        t1 = a - p0 * float(a @ p0)
+        t2 = b - p0 * float(b @ p0)
+        n1, n2 = float(np.linalg.norm(t1)), float(np.linalg.norm(t2))
+        if n1 < 1e-15 or n2 < 1e-15:
+            continue
+        t1, t2 = t1 / n1, t2 / n2
+        ang = math.atan2(float(np.linalg.norm(np.cross(t1, t2))),
+                         float(np.clip(t1 @ t2, -1.0, 1.0)))
+        total += ang
+    return total - (m - 2) * math.pi
+
+
+def cell_areas(P: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
+    """返回 (各胞腔面积数组, 胞腔顶点列表)。"""
+    cells = voronoi_cells(P)
+    return np.array([cell_area(V) for V in cells]), cells
+
+
+def area_uniformity(P: np.ndarray) -> Tuple[float, np.ndarray]:
+    """面积离散度 cv = std(A)/mean(A)（越小越均匀）与面积数组。"""
+    A, _ = cell_areas(P)
+    m = float(A.mean())
+    return (float(A.std() / m) if m > 1e-12 else float('inf')), A
+
+
+def _area_cv(P: np.ndarray) -> float:
+    return area_uniformity(P)[0]
+
+
+def _area_step(P: np.ndarray, cells: List[np.ndarray], cs: List[Optional[np.ndarray]],
+               w: np.ndarray) -> np.ndarray:
+    """朝各胞腔质心移动，位移按权重 w_i 缩放（w=1 即标准 Lloyd）。"""
+    Q = P.copy()
+    for i, c in enumerate(cs):
+        if c is None:
+            continue
+        t = math.acos(float(np.clip(c @ P[i], -1.0, 1.0)))
+        if t < 1e-12:
+            continue
+        ut = (c - P[i] * float(c @ P[i])) / math.sin(t)
+        a = float(np.clip(w[i], 0.0, 1.0)) * t
+        Q[i] = P[i] * math.cos(a) + ut * math.sin(a)
+        Q[i] /= np.linalg.norm(Q[i])
+    return Q
+
+
+def area_lloyd(P: np.ndarray, iters: int = 150, rate: float = 0.8,
+               power: float = 1.0, backtrack: bool = True,
+               history_every: int = 1) -> Tuple[np.ndarray, List[float]]:
+    """面积均匀化迭代：加权 Lloyd + 整轮 cv 回退（单调不增）。
+
+    rate   : 基础步长（1.0 表示直接移到质心）
+    power  : 权重指数，w_i = rate * (Ā/A_i)^power
+    backtrack : 若一轮没有降低 cv，则把步长减半重试
+    """
+    Q = normalize(np.array(P, dtype=float, copy=True))
+    hist: List[float] = [_area_cv(Q)]
+    a = rate
+    for it in range(iters):
+        A, cells = cell_areas(Q)
+        mean = float(A.mean())
+        cs = [cell_centroid_dirs(V) if len(V) >= 3 else None for V in cells]
+        w = np.clip(a * (mean / np.maximum(A, 1e-12)) ** power, 0.0, 1.0)
+        cand = _area_step(Q, cells, cs, w)
+        cv_new, cv_old = _area_cv(cand), _area_cv(Q)
+        if cv_new < cv_old - 1e-14:
+            Q = cand
+            a = min(rate, a * 1.10)
+        elif backtrack:
+            ok = False
+            for _ in range(6):
+                w *= 0.5
+                cand = _area_step(Q, cells, cs, w)
+                if _area_cv(cand) < cv_old - 1e-14:
+                    Q, ok = cand, True
+                    a = max(0.05, a * 0.5)
+                    break
+            if not ok:
+                break
+        else:
+            Q = cand
+        if it % history_every == 0:
+            hist.append(_area_cv(Q))
+    hist.append(_area_cv(Q))
+    return Q, hist
+
+
+def solve_area(n: int, seed: int = 0, iters: int = 120, verbose: bool = False) -> Dict:
+    """面积均匀目标：多候选 + 面积加权 Lloyd 抛光，按 cv 择优。
+
+    斐波那契格点在面积均匀度上本就接近最优，因此这里的关键不是"更强的单点迭代"，
+    而是**扩大候选集**：能量（s=1 / 对数）、k-center、Tammes 都能给出不同盆地，
+    再各自用面积加权 Lloyd 抛光一次，最后按 cv 取最小。
+    """
+    rng = np.random.default_rng(seed)
+    cands: List[np.ndarray] = [fibonacci_points(n)]
+    try:
+        cands.append(thomson(spiral_points(n, jitter=0.15, rng=rng), 1.0, iters=250)[0])
+        cands.append(thomson(spiral_points(n, jitter=0.35, rng=rng), 0.0, iters=250)[0])
+    except Exception:
+        pass
+    cands.append(kcenter_local_search(fibonacci_points(n), iters=40)[0])
+    try:
+        cands.append(tammes(fibonacci_points(n), iters=3000, rate=0.05, seed=seed)[0])
+    except Exception:
+        pass
+
+    results: List[Tuple[float, str, np.ndarray, List[float]]] = []
+    for k, P0 in enumerate(cands):
+        Q, h = area_lloyd(P0, iters=iters, rate=0.9, power=1.0)
+        results.append((_area_cv(Q), f"polish{k}", Q, h))
+        # 抛光前的原始候选也保留（有时抛光反而略差，择优即可）
+        results.append((_area_cv(P0), f"raw{k}", P0, []))
+    results.sort(key=lambda x: x[0])
+    cv_best, tag, P, h = results[0]
+    if verbose:
+        for c, t, _, _ in results[:6]:
+            print(f"      {t:<10} cv={c:.6f}", flush=True)
+    return {"points": normalize(P), "cv": cv_best, "history": h, "tag": tag}
+
+
+# --------------------------------------------------------------------------
+# 算法 5：球面 k-center（最小化覆盖半径 R_cov）
+# --------------------------------------------------------------------------
+# 目标 R_cov(P) = max_x min_i angle(x, p_i)，即"最小化最大距离"（k-center），
+# 与球面 Lloyd 最小化的"均方距离"（k-means）**不是**同一个目标。
+#
+# 局部搜索的两条要点：
+#   1) 移动方向取"胞腔内并列最远点（顶点/棱中点）的**平均**方向"。
+#      取单个最远点会破坏对称性：正八面体/正二十面体本身已是局部最优，
+#      朝单个顶点移动实测会让 R_cov 从 54.736° 恶化到 73°；取平均时
+#      并列方向互相抵消，于是能正确判定"已到局部最优"而停住。
+#   2) 每轮扫描后用**精确 R_cov 做整轮回退**，因此 R_cov 单调不增。
+#
+# 逃离局部极小：单点扰动 / 一步 Lloyd / 一步能量精修，仍只用精确 R_cov 判定。
+# 求解策略：把能量（Riesz s=1）多起点解当作 k-center 的**起点**（实测很关键），
+#           再加随机重启与扰动细化，最后统一按精确 R_cov 取最小。
+
+def cell_worst_set(P: np.ndarray, i: int, V: np.ndarray,
+                   tol: float = 0.02) -> Optional[np.ndarray]:
+    """site i 胞腔内"并列最远"的顶点/棱中点集合（(m,3) 单位向量）。"""
+    if len(V) < 3:
+        return np.array([-P[i]])                       # 退化胞腔（半球）：对跖点
+    cand = list(V)
+    W = np.roll(V, -1, axis=0)
+    mids = V + W
+    nm = np.linalg.norm(mids, axis=1, keepdims=True)
+    cand.extend(list(mids / np.where(nm > 1e-15, nm, 1.0)))
+    C = np.array(cand)
+    d = np.arccos(np.clip(C @ P[i], -1.0, 1.0))
+    dmax = float(d.max())
+    sel = C[d >= dmax * (1.0 - tol)]
+    return sel if len(sel) else None
+
+
+def kcenter_scan(Q: np.ndarray, step: float, tol: float) -> Tuple[np.ndarray, int, float]:
+    """一轮扫描：逐点朝自己"并列最远方向"走一小步。
+
+    返回 (新点集, 移动点数, 新构型的精确 R_cov)；R_cov 顺带在同一次
+    胞腔遍历里算出，避免外层重复构造 Voronoi。
+    """
+    cells = voronoi_cells(Q)
+    moved = 0
+    for i in range(len(Q)):
+        sel = cell_worst_set(Q, i, cells[i], tol)
+        if sel is None or len(sel) == 0:
+            continue
+        avg = sel.sum(axis=0)
+        na = float(np.linalg.norm(avg))
+        if na < 1e-12:
+            continue                                   # 方向相消 => 已局部最优
+        ut = _arc_dir(Q[i], avg / na)
+        if ut is None:
+            continue
+        Q[i] = _arc_point(Q[i], ut, step)
+        Q[i] /= np.linalg.norm(Q[i])
+        moved += 1
+    _, R = cells_and_radius(Q)
+    return Q, moved, R
+
+
+def kcenter_local_search(P: np.ndarray, iters: int = 150, step: float = 0.25,
+                         tols: Sequence[float] = (0.02, 0.08, 0.2),
+                         history_every: int = 1) -> Tuple[np.ndarray, List[float]]:
+    """整轮回退的 k-center 局部搜索：R_cov 单调不增。"""
+    Q = normalize(np.array(P, dtype=float, copy=True))
+    _, R = cells_and_radius(Q)
+    hist: List[float] = [R]
+    a = step
+    for it in range(iters):
+        improved = False
+        for tol in tols:
+            if a < 1e-7:
+                break
+            trial, moved, R_try = kcenter_scan(Q.copy(), a, tol)
+            if moved == 0:
+                continue
+            if R_try < R - 1e-14:
+                Q, R, improved = trial, R_try, True
+                a = min(step, a * 1.2)
+                break
+        if not improved:
+            a *= 0.5
+            if a < 1e-6:
+                break
+        if it % history_every == 0:
+            hist.append(R)
+    hist.append(R)
+    return Q, hist
+
+
+def _kcenter_escape(Q: np.ndarray, R: float) -> Optional[Tuple[np.ndarray, float]]:
+    """逃离局部极小：依次尝试 单点扰动 / 一步 Lloyd / 一步能量精修。"""
+    n = len(Q)
+    cells, _ = cells_and_radius(Q)
+    # (a) 只对"覆盖最差"的几个 site 做小幅扰动（遍历全部 site 太慢）
+    worst = []
+    for i, V in enumerate(cells):
+        if len(V) < 3:
+            continue
+        d = max(float(np.arccos(np.clip(v @ Q[i], -1, 1))).real for v in V)
+        worst.append((d, i))
+    worst.sort(reverse=True)
+    for _, i in worst[:5]:
+        V = cells[i]
+        sel = cell_worst_set(Q, i, V, tol=0.35)
+        if sel is None:
+            continue
+        for w in sel:
+            ut = _arc_dir(Q[i], w)
+            if ut is None:
+                continue
+            trial = Q.copy()
+            trial[i] = _arc_point(Q[i], ut, 0.02)
+            _, Rt = cells_and_radius(trial)
+            if Rt < R - 1e-14:
+                return trial, Rt
+    # (b) 一步球面 Lloyd（朝胞腔质心）
+    out = Q.copy()
+    for i in range(n):
+        c = cell_centroid_dirs(cells[i])
+        if c is None:
+            continue
+        t = math.acos(float(np.clip(c @ Q[i], -1.0, 1.0)))
+        if t < 1e-12:
+            continue
+        ut = _arc_dir(Q[i], c)
+        if ut is not None:
+            out[i] = _arc_point(Q[i], ut, t)
+    _, Rt = cells_and_radius(out)
+    if Rt < R - 1e-14:
+        return out, Rt
+    # (c) 一步能量精修
+    try:
+        Pw, _ = thomson(Q, 1.0, iters=20)
+        _, Rw = cells_and_radius(Pw)
+        if Rw < R - 1e-14:
+            return Pw, Rw
+    except Exception:
+        pass
+    return None
+
+
+def kcenter_solve(P: np.ndarray, iters: int = 120, step: float = 0.25,
+                  escape_rounds: int = 8) -> Tuple[np.ndarray, float]:
+    """局部搜索 + 逃逸，返回 (点集, 精确 R_cov)。"""
+    Q, _ = kcenter_local_search(P, iters=iters, step=step)
+    _, R = cells_and_radius(Q)
+    for _ in range(escape_rounds):
+        esc = _kcenter_escape(Q, R)
+        if esc is None:
+            break
+        Q2, R2 = kcenter_local_search(esc[0], iters=iters, step=step)
+        _, R2b = cells_and_radius(Q2)
+        Q, R = (Q2, R2b) if R2b < esc[1] else esc
+    return Q, R
+
+
+def _energy_seeds(n: int, rng: np.random.Generator, iters: int, count: int) -> List[np.ndarray]:
+    bases = [fibonacci_points(n),
+             spiral_points(n, jitter=0.15, rng=rng),
+             spiral_points(n, jitter=0.45, rng=rng)]
+    while len(bases) < count:
+        bases.append(random_points(n, rng))
+    return [thomson(P0, 1.0, iters=iters)[0] for P0 in bases[:count]]
+
+
+def _perturb(P: np.ndarray, rng: np.random.Generator, amp: float) -> np.ndarray:
+    """随机整体旋转 + 逐点抖动（探索当前盆地之外）。"""
+    axis = rng.normal(size=3)
+    axis /= np.linalg.norm(axis)
+    th = amp * rng.uniform(-1.0, 1.0)
+    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    Rm = np.eye(3) * math.cos(th) + K * math.sin(th) + np.outer(axis, axis) * (1 - math.cos(th))
+    return normalize(P @ Rm.T + rng.normal(scale=amp * 0.3, size=P.shape))
+
+
+def solve_cover(n: int, seed: int = 0, verbose: bool = False,
+                energy_iters: int = 300, tammes_iters: int = 6000) -> Dict:
+    """覆盖目标：多起点 + k-center + 随机重启 + 扰动细化，按精确 R_cov 择优。"""
+    rng = np.random.default_rng(seed)
+    kc_iters = 120 if n <= 60 else (60 if n <= 120 else 30)
+
+    starts: List[Tuple[str, np.ndarray]] = []
+    n_energy = 4 if n <= 60 else (2 if n <= 120 else 1)
+    for k, Pe in enumerate(_energy_seeds(n, rng, energy_iters, n_energy)):
+        starts.append((f"energy{k}", Pe))
+    try:
+        starts.append(("tammes", tammes(fibonacci_points(n), iters=tammes_iters,
+                                        rate=0.05, seed=seed)[0]))
+    except Exception:
+        pass
+    starts.append(("lloyd", coverage_lloyd(fibonacci_points(n), iters=100)[0]))
+    starts.append(("fib", fibonacci_points(n)))
+
+    results: List[Tuple[float, str, np.ndarray]] = []
+    for tag, P0 in starts:
+        Q, _ = kcenter_local_search(P0, iters=kc_iters, step=0.25)
+        results.append((coverage_radius(Q), f"kc({tag})", Q))
+
+    n_rnd = 8 if n <= 60 else (4 if n <= 120 else 2)
+    for k in range(n_rnd):
+        Q, _ = kcenter_local_search(random_points(n, rng), iters=kc_iters, step=0.25)
+        results.append((coverage_radius(Q), f"rand{k}", Q))
+
+    n_ref = 6 if n <= 60 else (2 if n <= 120 else 1)
+    for r in range(n_ref):
+        results.sort(key=lambda x: x[0])
+        Q, _ = kcenter_solve(_perturb(results[0][2], rng, 0.05 + 0.10 * r), iters=kc_iters)
+        results.append((coverage_radius(Q), f"refine{r}", Q))
+
+    results.sort(key=lambda x: x[0])
+    if verbose:
+        for R, tag, _ in results[:8]:
+            print(f"      {tag:<22} R_cov={math.degrees(R):9.5f}°", flush=True)
+    R, tag, P = results[0]
+    return {"points": normalize(P), "radius_deg": math.degrees(R), "tag": tag}
 
 
 # --------------------------------------------------------------------------
@@ -764,6 +1156,9 @@ def as_json_block(n: int, sol: Dict[str, Dict], digits: int = 6) -> Dict:
             vals = {"energy": float(val["energy"]), "minDeg": float(val["min_deg"])}
         elif key == "tammes":
             vals = {"minDeg": float(val["min_deg"]), "energy": float(val["energy"])}
+        elif key == "area":
+            vals = {"cv": float(val["cv"]), "minDeg": float(val["min_deg"]),
+                    "energy": float(val["energy"])}
         else:
             vals = {"radiusDeg": float(val["radius_deg"]), "minDeg": float(val["min_deg"]),
                     "energy": float(val["energy"])}

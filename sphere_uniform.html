@@ -75,6 +75,7 @@
           <option value="energy">能量最小（Thomson / Riesz，s 可调）</option>
           <option value="tammes">最小间距最大（Tammes）</option>
           <option value="cover">覆盖半径最小（covering）</option>
+          <option value="area">面积最均匀（Voronoi 胞腔等面积）</option>
         </select>
       </div>
       <div class="row"><label>来源</label>
@@ -117,9 +118,12 @@
       <h2>迭代优化（在浏览器里实时跑）</h2>
       <div class="row"><label>算法</label>
         <select id="algoSel">
+          <option value="auto">自动（按当前目标选择）</option>
           <option value="fw">能量最小：Frank–Wolfe</option>
           <option value="tammes">间距最大：次梯度上升</option>
-          <option value="lloyd">覆盖最小：球面 Lloyd</option>
+          <option value="kcenter">覆盖最小：k-center（推荐）</option>
+          <option value="arealloyd">面积均匀：加权 Lloyd</option>
+          <option value="lloyd">球面 Lloyd（k-means，仅作对照）</option>
         </select>
       </div>
       <div class="row"><label>指数 s</label>
@@ -158,11 +162,13 @@
         <button data-m="energy" class="on">能量</button>
         <button data-m="tammes">最小间距</button>
         <button data-m="cover">覆盖半径</button>
+        <button data-m="area">面积 cv</button>
       </div>
       <div class="metrics">
         <div class="k">能量 E</div><div></div><div class="v" id="mE">–</div>
         <div class="k">最小夹角 d<sub>min</sub></div><div></div><div class="v" id="mD">–</div>
         <div class="k">覆盖半径 R<sub>cov</sub></div><div></div><div class="v" id="mR">–</div>
+        <div class="k">面积离散度 cv</div><div></div><div class="v" id="mCv">–</div>
       </div>
       <canvas class="mini" id="chart"></canvas>
       <div class="note" id="cmpNote"></div>
@@ -309,6 +315,23 @@ function dminSubgrad(P,tol=1.02){
   return {dmin,g};
 }
 function normalizeAll(P){ return P.map(norm3); }
+/* 球面均匀随机点（用于随机重启） */
+function randomPoints(n, rnd){
+  rnd=rnd||Math.random;
+  const out=[];
+  for(let i=0;i<n;i++){
+    let x,y,z,d2;
+    do{ x=2*rnd()-1; y=2*rnd()-1; z=2*rnd()-1; d2=x*x+y*y+z*z; }while(d2>1||d2<1e-9);
+    out.push(norm3([x,y,z]));
+  }
+  return out;
+}
+let K_STUCK=0;        // 连续无进展计数
+let K_BEST_R=Infinity; // 历史最好的 R_cov
+let K_RESTART_FAIL=0;  // 连续失败的随机重启次数
+let K_STALL_TOTAL=0;   // 累计停滞次数（用于周期性恢复探索）
+let K_SCAN_FAIL=0;     // 扫描连续失败次数（用于节流）
+let K_ESC_TICK=0;      // 逃逸探针节流计数
 
 /* 切平面正交基（用于把球面点映射成二维坐标，只用于排序/凸包等辅助） */
 function basisFor(p){
@@ -384,15 +407,36 @@ function voronoiCells(P, kNear = 16) {
   return cells;
 }
 /* 球面多边形面积（球面盈余 / L'Huilier 的稳定形式） */
+/* 球面多边形面积 = 球面盈余 = (内角之和) − (m−2)π
+   逐个顶点求内角（顶点处两条切向量的夹角）。
+   注意：不能用 Σ 2·atan2(|u×w|, u·w) 这种平面写法 —— 对球面多边形不成立
+   （实测正二十面体一个胞腔会算成 7.30 而非 2π，面积总和会变成 87 而非 4π=12.566）。 */
 function cellArea(V){
-  const m=V.length; if(m<3) return 0; let a=0;
+  const m=V.length; if(m<3) return 0;
+  let total=0;
   for(let i=0;i<m;i++){
-    const u=V[i], w=V[(i+1)%m];
-    const c=cross(u,w), nc=Math.hypot(c[0],c[1],c[2]);
-    if(nc<1e-15) continue;
-    a += 2*Math.atan2(nc, dot(u,w));
+    const p0=V[i], a=V[(i-1+m)%m], b=V[(i+1)%m];
+    let t1=[a[0]-p0[0]*dot(a,p0), a[1]-p0[1]*dot(a,p0), a[2]-p0[2]*dot(a,p0)];
+    let t2=[b[0]-p0[0]*dot(b,p0), b[1]-p0[1]*dot(b,p0), b[2]-p0[2]*dot(b,p0)];
+    const n1=Math.hypot(t1[0],t1[1],t1[2]), n2=Math.hypot(t2[0],t2[1],t2[2]);
+    if(n1<1e-15||n2<1e-15) continue;
+    t1=[t1[0]/n1,t1[1]/n1,t1[2]/n1]; t2=[t2[0]/n2,t2[1]/n2,t2[2]/n2];
+    const c=cross(t1,t2);
+    total += Math.atan2(Math.hypot(c[0],c[1],c[2]), clamp(dot(t1,t2),-1,1));
   }
-  return Math.abs(a);
+  return total-(m-2)*Math.PI;
+}
+/* 各胞腔面积 + 面积离散度 cv = std/mean（越小越均匀） */
+function cellAreasOf(P){
+  const cells=voronoiCells(P);
+  return {areas:cells.map(cellArea), cells:cells};
+}
+function areaCvOf(P){
+  const A=cellAreasOf(P).areas.filter(x=>x>0);
+  if(A.length<2) return 0;
+  const m=A.reduce((a,b)=>a+b,0)/A.length;
+  if(!(m>1e-12)) return 0;
+  return Math.sqrt(A.reduce((a,b)=>a+(b-m)*(b-m),0)/A.length)/m;
 }
 function coverageRadius(P){
   const cells=voronoiCells(P); let R=0;
@@ -504,6 +548,7 @@ function exportConfig(){
       energy:m.e,
       minAngleDeg:m.d*180/Math.PI,
       coverageRadiusDeg:m.r*180/Math.PI,
+      areaCv:m.cv,
     },
     points:S.P.map(p=>[+p[0].toFixed(9),+p[1].toFixed(9),+p[2].toFixed(9)]),
   };
@@ -575,7 +620,8 @@ function importConfig(obj){
   S.P=pts.map(p=>p.slice());
   S.iters=0; S.running=false; setRunBtn();
   alphaT=0.05;
-  S.hist={energy:[],tammes:[],cover:[]};
+  A_CAND_CACHE=null; A_CAND_N=-1;
+  S.hist={energy:[],tammes:[],cover:[],area:[]};
   syncNControls(pts.length);
   document.getElementById('nameIn').value=name;
   S.metrics=computeMetrics(S.P);
@@ -730,6 +776,280 @@ function tammesStep(P,alpha){
   const dNew=minAngle(out);
   return {P: out, ok: dNew>=dmin-1e-12, val:dNew};
 }
+/* 大圆工具：从 p 朝 target 的单位切向量，以及沿大圆走弧长 t 的点。
+   推导：d = target - p = sinθ·u - (1-cosθ)·p  =>  u = d/sinθ + tan(θ/2)·p */
+function geodesicTangent(p, target){
+  const a=norm3(p), b=norm3(target);
+  const c=clamp(dot(a,b),-1,1);
+  const sn=Math.sqrt(Math.max(1-c*c,0));
+  if(sn<1e-12) return null;
+  const half=Math.sqrt(Math.max((1-c)/2,0));      // sin(θ/2)
+  const cosHalf=Math.sqrt(Math.max((1+c)/2,0));   // cos(θ/2)
+  if(cosHalf<1e-12) return null;
+  const u=[(b[0]-c*a[0])/sn,(b[1]-c*a[1])/sn,(b[2]-c*a[2])/sn];
+  const n=Math.hypot(u[0],u[1],u[2]);
+  if(!(n>1e-12)) return null;
+  return [u[0]/n,u[1]/n,u[2]/n];
+}
+function arcPoint(p, ut, t){
+  const q=[p[0]*Math.cos(t)+ut[0]*Math.sin(t),
+           p[1]*Math.cos(t)+ut[1]*Math.sin(t),
+           p[2]*Math.cos(t)+ut[2]*Math.sin(t)];
+  return norm3(q);
+}
+
+/* ===== 面积均匀（加权 Lloyd）=====
+   目标 cv = std(A_i)/mean(A_i)。做法：朝各胞腔质心移动，权重 w_i ∝ Ā/A_i
+   （面积大的少动、小的多动），并用整轮 cv 回退保证单调不增。
+   实测（Python cmp_area.py）：裸 Lloyd 在 n=50 降约 79%，加权再多降几点；
+   对已经很好的格点（斐波那契 n≥100）几乎没有改善空间。 */
+/* 胞腔的“平均方向”（球面质心的稳定近似）：按相邻棱的弧长加权 */
+function cellCentroid(V){
+  if(!V||V.length<3) return null;
+  let ax=0,ay=0,az=0;
+  for(let k=0;k<V.length;k++){
+    const u=V[k], w=V[(k+1)%V.length];
+    const ang=Math.acos(clamp(dot(u,w),-1,1));
+    const m=norm3([u[0]+w[0],u[1]+w[1],u[2]+w[2]]);
+    ax+=(u[0]+m[0])*ang; ay+=(u[1]+m[1])*ang; az+=(u[2]+m[2])*ang;
+  }
+  const nrm=Math.hypot(ax,ay,az);
+  if(!(nrm>1e-12)) return null;
+  return [ax/nrm,ay/nrm,az/nrm];
+}
+
+let A_RATE=0.9;
+function areaLloydStep(P){
+  const {areas:A, cells}=cellAreasOf(P);
+  const mean=A.reduce((x,y)=>x+y,0)/(A.length||1);
+  const cv0=areaCvOf(P);
+  let a=A_RATE;
+  for(let attempt=0;attempt<5;attempt++){
+    const Q=P.map(p=>p.slice());
+    for(let i=0;i<Q.length;i++){
+      const c=cellCentroid(cells[i]);
+      if(!c) continue;
+      const t=Math.acos(clamp(dot(c,P[i]),-1,1));
+      if(t<1e-12) continue;
+      const ut=geodesicTangent(P[i],c); if(!ut) continue;
+      const w=clamp(a*(mean/Math.max(A[i],1e-12)),0,1);
+      Q[i]=arcPoint(P[i],ut,w*t);
+    }
+    const cv1=areaCvOf(Q);
+    if(cv1<cv0-1e-14){ A_RATE=Math.min(0.95,a*1.05); return {P:Q, val:cv1}; }
+    a*=0.5;
+  }
+  // 大步长全失败时，再用很小的步长试一次（纯下降流在小步长下往往还能走）
+  for(const tiny of [0.05,0.02,0.01]){
+    const Q=P.map(p=>p.slice());
+    for(let i=0;i<Q.length;i++){
+      const c=cellCentroid(cells[i]);
+      if(!c) continue;
+      const t=Math.acos(clamp(dot(c,P[i]),-1,1));
+      if(t<1e-12) continue;
+      const ut=geodesicTangent(P[i],c); if(!ut) continue;
+      const w=clamp(tiny*(mean/Math.max(A[i],1e-12)),0,1);
+      Q[i]=arcPoint(P[i],ut,w*t);
+    }
+    const cv1=areaCvOf(Q);
+    if(cv1<cv0-1e-14){ A_RATE=tiny; return {P:Q, val:cv1}; }
+  }
+  A_RATE=0.9;
+  return null;
+}
+
+/* 面积目标的"一次充分改进"：换几个起点分别跑加权 Lloyd，取 cv 最小的。
+   单靠一条下降流会很快停在格点对应的局部极小（实测 n=12 一步就停），
+   而能量解当起点能显著更好（n=20 可降约 33%），所以必须多起点。 */
+let A_CAND_CACHE=null, A_CAND_N=-1;
+function areaImprove(P, budget){
+  budget=budget||3;
+  // 缓存必须与点数绑定：否则切换 N 时会复用上一个 N 的候选
+  // （曾导致 n=50 的点集被替换成 n=20 的 20 个点，cv 假性降到 3e-6）
+  if(!A_CAND_CACHE || A_CAND_N!==P.length){
+    A_CAND_N=P.length;
+    A_CAND_CACHE=[P.map(p=>p.slice())];
+    let Q=P.map(p=>p.slice());
+    for(let k=0;k<98;k++){
+      const r=fwStep(Q,S.s);
+      if(!r) break;
+      Q=r.P;
+      if((k+1)%14===0) A_CAND_CACHE.push(Q.map(p=>p.slice()));
+    }
+  }
+  const cands=[P].concat(A_CAND_CACHE.filter(C=>C.length===P.length));
+  let best=null;
+  for(const C of cands){
+    let Q=C.map(p=>p.slice());
+    let cv=areaCvOf(Q);
+    for(let k=0;k<budget;k++){
+      const r=areaLloydStep(Q);
+      if(!r) break;
+      Q=r.P;
+      const c2=areaCvOf(Q);
+      if(c2<cv-1e-15){ cv=c2; } else break;
+    }
+    if(!best||cv<best.val-1e-15) best={P:Q, val:cv};
+  }
+  return (best && best.val<areaCvOf(P)-1e-15) ? best : null;
+}
+
+/* ===== 覆盖最小（k-center）=====
+   R_cov = max_x min_i angle(x, p_i)。
+   与 Lloyd 的区别：Lloyd 最小化均方距离（k-means），k-center 最小化**最大**距离。
+   算法：每个 site 朝自己胞腔内"并列最远"方向的平均走一步，整轮用精确 R_cov 回退。 */
+const KCELL_MAX=150;                     // 超过这个点数就改用格点近似
+let K_STEP=0.25;                         // k-center 步长（自适应）
+
+function cellWorstAvg(P,voroCells,i,tol){
+  const V=voroCells[i];
+  if(!V||V.length<3){
+    // 退化胞腔（半球）：最远方向是对跖点
+    return [-P[i][0],-P[i][1],-P[i][2]];
+  }
+  const cand=[];
+  for(const v of V) cand.push(v);
+  for(let k=0;k<V.length;k++){
+    const w=V[(k+1)%V.length];
+    const m=norm3([V[k][0]+w[0],V[k][1]+w[1],V[k][2]+w[2]]);
+    if(Number.isFinite(m[0])) cand.push(m);
+  }
+  let dmax=0;
+  const d=cand.map(c=>{const a=Math.acos(clamp(dot(c,P[i]),-1,1)); if(a>dmax)dmax=a; return a;});
+  let ax=0,ay=0,az=0,nsel=0;
+  for(let k=0;k<cand.length;k++){
+    if(d[k]>=dmax*(1-tol)){ ax+=cand[k][0]; ay+=cand[k][1]; az+=cand[k][2]; nsel++; }
+  }
+  const nrm=Math.hypot(ax,ay,az);
+  if(nrm<1e-12||nsel===0) return null;          // 方向相消 => 已局部最优
+  return [ax/nrm,ay/nrm,az/nrm];
+}
+
+function kcenterScan(Q,step,tol,useExact){
+  const n=Q.length, out=Q.map(p=>p.slice());
+  let worst=0;
+  if(useExact){
+    const cells=voronoiCells(Q);
+    for(let i=0;i<n;i++){
+      const w=cellWorstAvg(Q,cells,i,tol);
+      if(!w) continue;
+      const ut=geodesicTangent(out[i],w);
+      if(!ut) continue;
+      out[i]=arcPoint(out[i],ut,step);
+    }
+  } else {
+    // 大 N：用斐波那契格点找每个 site 的"最坏方向"
+    const M=n<=400?4000:(n<=900?2500:1500);
+    const G=fibonacciPoints(M);
+    const owner=new Int32Array(M), far=new Float64Array(M);
+    for(let k=0;k<M;k++){
+      let bi=0,bd=-2;
+      for(let i=0;i<n;i++){ const t=dot(G[k],Q[i]); if(t>bd){bd=t;bi=i;} }
+      owner[k]=bi; far[k]=Math.acos(clamp(bd,-1,1));
+    }
+    const acc=Array.from({length:n},()=>[0,0,0]);
+    for(let k=0;k<M;k++){
+      const i=owner[k];
+      const th=Math.max(far[i],1e-12);
+      const wgt=(far[k]>=th*0.98)?1:0;
+      if(wgt){ acc[i][0]+=G[k][0]; acc[i][1]+=G[k][1]; acc[i][2]+=G[k][2]; }
+    }
+    for(let i=0;i<n;i++){
+      const nrm=Math.hypot(...acc[i]);
+      if(nrm<1e-12) continue;
+      const w=[acc[i][0]/nrm,acc[i][1]/nrm,acc[i][2]/nrm];
+      const ut=geodesicTangent(out[i],w);
+      if(!ut) continue;
+      out[i]=arcPoint(out[i],ut,step);
+    }
+  }
+  return {P:out, val:useExact?coverageRadius(out):gridCoverRadius(out)};
+}
+function gridCoverRadius(P){
+  const n=P.length, M=n<=400?4000:(n<=900?2500:1500), G=fibonacciPoints(M);
+  let worst=0;
+  for(let k=0;k<M;k++){
+    let bd=-2;
+    for(let i=0;i<n;i++){ const t=dot(G[k],P[i]); if(t>bd) bd=t; }
+    const a=Math.acos(clamp(bd,-1,1));
+    if(a>worst) worst=a;
+  }
+  return worst;
+}
+/* 目标函数：点数少时用**精确** R_cov，大 N 时用斐波那契格点估计 */
+function coverageOf(P){
+  return P.length<=KCELL_MAX ? coverageRadius(P) : gridCoverRadius(P);
+}
+
+/* 一轮轻量扫描：单个容差 + 最多 2 次步长回退（每帧调用，成本可控） */
+function kcenterScanFast(P){
+  const useExact=P.length<=KCELL_MAX;
+  const R0=coverageOf(P);
+  // 一级容差（tol=0.02）用当前步长；失败后最多回退 2 次。
+  // 第二档（tol=0.15，放宽"并列"定义）只在连续失败不多时才尝试，控制单步成本。
+  let a=K_STEP;
+  for(let tries=0;tries<2;tries++){
+    const res=kcenterScan(P,a,0.02,useExact);
+    if(res.val<R0-1e-14){ K_STEP=Math.min(0.5,a*1.15); return res; }
+    a*=0.5;
+  }
+  if(K_SCAN_FAIL<2){
+    let b=Math.min(K_STEP,0.12);
+    for(let tries=0;tries<2;tries++){
+      const res=kcenterScan(P,b,0.15,useExact);
+      if(res.val<R0-1e-14){ K_STEP=Math.min(0.5,b*1.15); K_SCAN_FAIL=0; return res; }
+      b*=0.5;
+    }
+  }
+  K_STEP=Math.max(0.02,K_STEP*0.8);
+  K_SCAN_FAIL=Math.min(9,K_SCAN_FAIL+1);
+  return null;
+}
+
+/* 廉价逃逸：只看"覆盖最差"的几个 site，试它们各自的单个最远方向（小幅扰动）。
+   对称构型（正八面体/正二十面体）在这里会立刻失败，于是上层判定已到局部最优。 */
+function kcenterEscapeCheap(P, R, nProbe){
+  const n=P.length;
+  if(n>KCELL_MAX) return null;
+  const cells=voronoiCells(P);
+  // 找覆盖最差的几个 site（胞腔最远距离最大）
+  const worst=[];
+  for(let i=0;i<n;i++){
+    const V=cells[i]; if(!V||V.length<3) continue;
+    let d=0;
+    for(const v of V) d=Math.max(d,Math.acos(clamp(dot(v,P[i]),-1,1)));
+    for(let k=0;k<V.length;k++){
+      const w=V[(k+1)%V.length];
+      const m=norm3([V[k][0]+w[0],V[k][1]+w[1],V[k][2]+w[2]]);
+      d=Math.max(d,Math.acos(clamp(dot(m,P[i]),-1,1)));
+    }
+    worst.push([d,i]);
+  }
+  worst.sort((x,y)=>y[0]-x[0]);
+  const probes=worst.slice(0,Math.max(2,Math.min(nProbe||5,worst.length)));
+  let best=null;
+  for(const [,i] of probes){
+    const V=cells[i];
+    const cand=[];
+    for(const v of V) cand.push(v);
+    for(let k=0;k<V.length;k++){
+      const w=V[(k+1)%V.length];
+      cand.push(norm3([V[k][0]+w[0],V[k][1]+w[1],V[k][2]+w[2]]));
+    }
+    let dmax=0;
+    const dd=cand.map(c=>{const a=Math.acos(clamp(dot(c,P[i]),-1,1)); if(a>dmax)dmax=a; return a;});
+    for(let k=0;k<cand.length;k++){
+      if(dd[k]<dmax*0.75) continue;
+      const ut=geodesicTangent(P[i],cand[k]); if(!ut) continue;
+      const trial=P.map(q=>q.slice());
+      trial[i]=arcPoint(P[i],ut,0.02);
+      const Rt=coverageOf(trial);
+      if(Rt<R-1e-14 && (!best||Rt<best.val)) best={P:trial,val:Rt};
+    }
+  }
+  return best;
+}
+
 let GRID=null;
 function gridPoints(M){
   if(GRID&&GRID.length===M) return GRID;
@@ -901,7 +1221,8 @@ function computeMetrics(P){
     }
     r=worst;
   }
-  return {e:rieszEnergy(P,s), d:minAngle(P), r, exactCover:exact};
+  const cv=areaCvOf(P);
+  return {e:rieszEnergy(P,s), d:minAngle(P), r, cv, exactCover:exact};
 }
 function fmt(x,n=4){ return Number.isFinite(x)?x.toFixed(n):'–'; }
 /* 预计算参照只对 s=1 的能量目标成立，其它 s 要让用户知道 */
@@ -924,7 +1245,9 @@ function updateMetrics(){
   document.getElementById('mD').textContent=(m.d*180/Math.PI).toFixed(4)+'°';
   document.getElementById('mR').textContent=
     (m.exactCover===false?'≈':'')+(m.r*180/Math.PI).toFixed(4)+'°';
-  const v={energy:m.e,tammes:m.d*180/Math.PI,cover:m.r*180/Math.PI}[S.metric];
+  document.getElementById('mCv').textContent=(m.cv==null?'–':m.cv.toFixed(5));
+  const v={energy:m.e,tammes:m.d*180/Math.PI,cover:m.r*180/Math.PI,
+           area:(m.cv==null?0:m.cv)}[S.metric];
   // 历史按时间抽稀（约每 60ms 一个点），否则 60fps 下曲线没有意义
   const now=performance.now();
   if(!S.lastPush||now-S.lastPush>60){
@@ -972,22 +1295,66 @@ let alphaT=0.05, acc=0;
    否则切换 s 之后，面板显示的能量与算法正在下降的能量不是同一个量。 */
 function stepAlgo(){
   const n=S.P.length;
-  if(S.algo==='fw'){
+  const algo=effectiveAlgo();
+  if(algo==='kcenter'){
+    const before=coverageOf(S.P);
+    // ① 轻量扫描（精确/格点由 coverageOf 决定）
+    const sc=kcenterScanFast(S.P);
+    if(sc){
+      S.P=sc.P;
+      if(!S.kBest||sc.val<K_BEST_R-1e-14){ S.kBest=sc.P.map(p=>p.slice()); K_BEST_R=sc.val; }
+      K_STUCK=0; K_RESTART_FAIL=0; K_SCAN_FAIL=0;
+      return true;
+    }
+    // ② 扫描无进展：偶尔做一次廉价逃逸（只看覆盖最差的 2 个 site）
+    K_ESC_TICK=(K_ESC_TICK||0)+1;
+    let esc=null;
+    if(K_ESC_TICK%4===0) esc=kcenterEscapeCheap(S.P,before,2);
+    if(esc){
+      S.P=esc.P;
+      if(!S.kBest||esc.val<K_BEST_R-1e-14){ S.kBest=esc.P.map(p=>p.slice()); K_BEST_R=esc.val; }
+      K_STUCK=0; K_RESTART_FAIL=0;
+      return true;
+    }
+    // ③ 停滞：插入一次随机重启（kBest 始终是历史最好，因此不会变差）
+    if(!S.kBest){ S.kBest=S.P.map(p=>p.slice()); K_BEST_R=before; }
+    K_STUCK++;
+    // 重启失败太多次后重新允许探索，否则会永久停在弱局部极小
+    K_STALL_TOTAL=(K_STALL_TOTAL||0)+1;
+    if(K_STALL_TOTAL>150){ K_STALL_TOTAL=0; K_RESTART_FAIL=0; }
+    if(K_STUCK>=8 && K_RESTART_FAIL<60){
+      K_STUCK=0;
+      const cand=randomPoints(n);
+      // 先对随机点做几次扫描再比较
+      let Q=cand, Rq=coverageOf(Q);
+      for(let k=0;k<6;k++){ const s2=kcenterScanFast(Q); if(!s2) break; Q=s2.P; Rq=s2.val; }
+      if(Rq<K_BEST_R-1e-14){ S.kBest=Q.map(p=>p.slice()); K_BEST_R=Rq; K_RESTART_FAIL=0; }
+      else K_RESTART_FAIL++;
+      S.P=S.kBest.map(p=>p.slice());
+      return true;
+    }
+    return true;
+  }
+  if(algo==='arealloyd'){
+    const res=areaImprove(S.P,3);
+    if(res) S.P=res.P;
+    return true;
+  }
+  if(algo==='lloyd'){
+    const M=n<=40?8000:(n<=90?5000:(n<=200?3000:(n<=600?1500:700)));
+    const res=lloydStep(S.P,M);
+    S.P=res.P; return true;
+  }
+  if(algo==='fw'){
     const res=fwStep(S.P,S.s);
     if(!res) return false;
     S.P=res.P; return true;
   }
-  if(S.algo==='tammes'){
+  if(algo==='tammes'){
     const res=tammesStep(S.P,alphaT);
     if(res.ok){ S.P=res.P; alphaT=Math.min(alphaT*1.02,0.05); return true; }
     alphaT*=0.6; if(alphaT<1e-7) alphaT=0.02;
     return true;
-  }
-  if(S.algo==='lloyd'){
-    // 网格规模随 n 自适应，保证每步仍在预算内
-    const M=n<=40?8000:(n<=90?5000:(n<=200?3000:(n<=600?1500:700)));
-    const res=lloydStep(S.P,M);
-    S.P=res.P; return true;
   }
   return false;
 }
@@ -1030,7 +1397,21 @@ function loop(ts){
     `d_min=${(S.metrics.d*180/Math.PI).toFixed(3)}°`;
   requestAnimationFrame(loop);
 }
-function algoName(a){return {fw:'Frank–Wolfe（能量最小）',tammes:'次梯度上升（间距最大）',lloyd:'球面 Lloyd（覆盖最小）'}[a];}
+function algoName(a){
+  return {auto:'自动',fw:'Frank–Wolfe（能量最小）',
+          tammes:'次梯度上升（间距最大）',
+          kcenter:'k-center（覆盖最小）',
+          arealloyd:'加权 Lloyd（面积均匀）',
+          lloyd:'球面 Lloyd（k-means 对照）'}[a]||a;
+}
+/* "自动"：按当前目标挑合适的算法 */
+function effectiveAlgo(){
+  if(S.algo!=='auto') return S.algo;
+  if(S.obj==='tammes') return 'tammes';
+  if(S.obj==='cover') return 'kcenter';
+  if(S.obj==='area') return 'arealloyd';
+  return 'fw';
+}
 
 /* ============================================================================
    8. 交互绑定
@@ -1054,7 +1435,9 @@ function gensphere(){
   S.base=base.map(p=>p.slice());
   S.P=base.map(p=>p.slice());
   S.iters=0; alphaT=0.05;
-  S.hist={energy:[],tammes:[],cover:[]};
+  S.kBest=null; K_BEST_R=Infinity; K_STUCK=0; K_RESTART_FAIL=0;
+  A_CAND_CACHE=null; A_CAND_N=-1;
+  S.hist={energy:[],tammes:[],cover:[],area:[]};
   S.metrics=computeMetrics(S.P);
   updateMetrics(); draw();
   updateDataNote();
@@ -1090,7 +1473,8 @@ function applyS(raw, markCustom){
   if(sPreset) sPreset.value=String(S.s);
   S.objCustom=(markCustom!==undefined)?markCustom:true;
   S.iters=0;
-  S.hist={energy:[],tammes:[],cover:[]};
+  A_CAND_CACHE=null; A_CAND_N=-1;
+  S.hist={energy:[],tammes:[],cover:[],area:[]};
   S.metrics=computeMetrics(S.P);
   updateMetrics(); draw();
   const note=document.getElementById('iterNote');
